@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 {
   "manifest_version": 3,
   "name": "MV3 Event Recorder (MVP)",
@@ -14,3 +15,21 @@
   }],
   "action": { "default_title": "Recorder" }
 }
+=======
+{
+  "manifest_version": 3,
+  "name": "Rainbow Extension v0.2",
+  "version": "0.0.1",
+  "description": "DOM 입력 이벤트를 수집해 배치 전송합니다.",
+  "permissions": ["storage", "webNavigation", "webRequest","alarms"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js" },
+  "content_scripts": [{
+    "matches": ["<all_urls>"],
+    "js": ["content.js"],
+    "run_at": "document_start",
+    "all_frames": true
+  }],
+  "action": { "default_title": "Recorder" }
+}
+>>>>>>> c90b673 (Initail commit)
