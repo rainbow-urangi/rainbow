@@ -1,9 +1,16 @@
 {
   "manifest_version": 3,
-  "name": "Rainbow Extension v0.3",
-  "version": "0.0.3",
-  "description": "DOM 입력 이벤트를 수집해 배치 전송합니다.",
-  "permissions": ["storage", "webNavigation", "webRequest", "alarms"],
+  "name": "Rainbow Extension v0.4",
+  "version": "0.0.4",
+  "description": "DOM 입력/메뉴 이벤트를 수집하고 CSV로 내보냅니다.",
+  "permissions": [
+    "storage",
+    "webNavigation",
+    "webRequest",
+    "alarms",
+    "downloads",
+    "tabs"
+  ],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [{
@@ -12,5 +19,11 @@
     "run_at": "document_start",
     "all_frames": true
   }],
-  "action": { "default_title": "Recorder" }
+  "action": { "default_title": "Export AZ CSV" },
+  "commands": {
+    "export-csv": {
+      "suggested_key": { "default": "Ctrl+Shift+E", "mac": "Command+Shift+E" },
+      "description": "Export AZ CSV"
+    }
+  }
 }
