@@ -1,335 +1,233 @@
-// content.js — 입력 "최종값" + 메뉴/액션 정보 풍부 수집 + SPA 라우팅 포착
+// content.js — Robust capture for Selenium replay
+// (입력 최종값/메뉴/라우팅/페이지뷰 + 로케이터/컨텍스트/후행신호/프레임/섀도우)
 
-// ── Polyfill ──────────────────────────────────────────────
-(function ensureCssEscape() {
-  if (typeof CSS === "undefined") { window.CSS = {}; }
+// ---- CSS.escape 폴리필 ----
+(function ensureCssEscape(){
+  if (typeof CSS === "undefined") window.CSS = {};
   if (typeof CSS.escape !== "function") {
-    CSS.escape = s => String(s).replace(/[^a-zA-Z0-9_\-]/g, ch => `\\${ch}`);
+    CSS.escape = (s)=> String(s).replace(/[^a-zA-Z0-9_\-]/g, ch => `\\${ch}`);
   }
 })();
 
-// ── CSS/XPath ─────────────────────────────────────────────
-function cssPath(el) {
+// ---- 공용 유틸 ----
+const now = ()=> Date.now();
+const textOf = (n)=> (n?.textContent || "").replace(/\s+/g," ").trim() || null;
+
+function cssPath(el){
   if (!(el instanceof Element)) return "";
   if (el.id) return `#${CSS.escape(el.id)}`;
-  const parts = [];
+  const parts=[];
   while (el && el.nodeType === 1 && parts.length < 8) {
     let part = el.nodeName.toLowerCase();
-    if (el.classList.length) part += "." + [...el.classList].map(c => CSS.escape(c)).join(".");
-    const siblings = [...(el.parentNode?.children || [])].filter(n => n.nodeName === el.nodeName);
-    if (siblings.length > 1) part += `:nth-of-type(${siblings.indexOf(el)+1})`;
-    parts.unshift(part);
-    el = el.parentElement;
+    if (el.classList.length) part += "." + [...el.classList].map(CSS.escape).join(".");
+    const sib=[...(el.parentNode?.children||[])].filter(x=>x.nodeName===el.nodeName);
+    if (sib.length > 1) part += `:nth-of-type(${sib.indexOf(el)+1})`;
+    parts.unshift(part); el = el.parentElement;
   }
   return parts.join(" > ");
 }
-function xPath(el) {
+function xPath(el){
   if (!(el instanceof Element)) return "";
   if (el.id) return `//*[@id="${el.id}"]`;
-  const segs = [];
-  for (; el && el.nodeType === 1; el = el.parentNode) {
-    let i = 1;
-    for (let sib = el.previousSibling; sib; sib = sib.previousSibling)
-      if (sib.nodeType === 1 && sib.nodeName === el.nodeName) i++;
+  const segs=[];
+  for (; el && el.nodeType === 1; el = el.parentNode){
+    let i=1;
+    for(let s=el.previousSibling; s; s=s.previousSibling)
+      if(s.nodeType===1 && s.nodeName===el.nodeName) i++;
     segs.unshift(`${el.nodeName.toLowerCase()}[${i}]`);
   }
-  return "/" + segs.join("/");
+  return "/"+segs.join("/");
 }
-
-// ── 공통 유틸 ─────────────────────────────────────────────
-function textOf(node) {
-  return (node?.textContent || "").replace(/\s+/g, " ").trim() || null;
-}
-function fnv1aHex(str) {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < str.length; i++) { h ^= str.charCodeAt(i); h = Math.imul(h, 0x01000193); }
-  return (h >>> 0).toString(16).padStart(8, "0");
-}
-function now() { return Date.now(); }
-function pickDataAttrs(el, limit=20) {
-  if (!el?.attributes) return {};
-  const out = {};
-  let n = 0;
-  for (const attr of el.attributes) {
-    if (attr.name.startsWith("data-")) {
-      out[attr.name] = String(attr.value).slice(0, 200);
-      if (++n >= limit) break;
-    }
-  }
+function datasetAttrs(el, prefix='data-'){
+  const out={}; if(!el?.attributes) return out;
+  for (const a of el.attributes) if (a.name.startsWith(prefix)) out[a.name] = String(a.value).slice(0,200);
   return out;
 }
-function bounding(el) {
-  try { const r = el.getBoundingClientRect(); return { x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height) }; }
-  catch { return null; }
+function formContext(el){
+  const f = el?.closest?.('form');
+  return f ? { selector: cssPath(f), id: f.id||null, name: f.getAttribute('name')||null, action: f.getAttribute('action')||null } : null;
+}
+function bounding(el){
+  try{
+    const r = el.getBoundingClientRect();
+    return { x:Math.round(r.x), y:Math.round(r.y), w:Math.round(r.width), h:Math.round(r.height) };
+  }catch{ return null; }
+}
+function getShadowPath(el){
+  const chain=[];
+  let node = el;
+  while (node) {
+    const root = node.getRootNode?.();
+    if (root && root.host) { chain.unshift(cssPath(root.host)); node = root.host; }
+    else node = node.parentElement;
+  }
+  return chain;
+}
+function getFramePath(win){
+  try{
+    const chain=[]; let w=win;
+    while (w && w.frameElement) { chain.unshift(cssPath(w.frameElement)); w = w.parent; }
+    return chain;
+  }catch{ return []; }
 }
 
-// ── 민감정보 마스킹(입력값) ───────────────────────────────
-function maskValue(el, v) {
-  const type = (el.getAttribute("type") || "").toLowerCase();
-  const name = (el.getAttribute("name") || "").toLowerCase();
-  if (type === "password") return "*****";
-  if (/pass|pwd|ssn|card|credit|주민|비번/i.test(name)) return "*****";
-  if (typeof v === "string" && v.includes("@")) {
-    const [id, dom] = v.split("@");
-    return (id?.slice(0,2) || "*") + "***@" + (dom?.split(".")[0]?.[0] || "*") + "***";
+// ---- 민감정보 마스킹 ----
+function maskValue(el, v){
+  const type=(el.getAttribute('type')||"").toLowerCase();
+  const name=(el.getAttribute('name')||"").toLowerCase();
+  if (type==="password" || /pass|pwd|ssn|card|credit|주민|비번/i.test(name)) return "*****";
+  if (typeof v === "string" && v.includes("@")){
+    const [id, dom] = v.split("@"); return (id?.slice(0,2)||"*")+"***@"+(dom?.split(".")[0]?.[0]||"*")+"***";
   }
   return v;
 }
 
-// ── 라벨/타입/식별자(입력) ────────────────────────────────
-function getInputType(el) {
-  if (el.tagName === "TEXTAREA") return "textarea";
-  if (el.tagName === "SELECT") return "select";
-  return (el.getAttribute("type") || "text").toLowerCase();
-}
-function getLabel(el) {
-  if (el.labels && el.labels.length) { const t = textOf(el.labels[0]); if (t) return t; }
-  if (el.id) {
-    const byFor = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
-    const t = textOf(byFor); if (t) return t;
-  }
-  const aria = el.getAttribute("aria-label"); if (aria?.trim()) return aria.trim();
-  const ariaIds = (el.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean);
-  if (ariaIds.length) {
-    const joined = ariaIds.map(id => textOf(document.getElementById(id))).filter(Boolean).join(" ");
-    if (joined) return joined;
-  }
-  const ph = el.getAttribute("placeholder"); if (ph?.trim()) return ph.trim();
-  const title = el.getAttribute("title"); if (title?.trim()) return title.trim();
-  const td = el.closest("td,th,div,li"); const prev = td?.previousElementSibling;
-  const prevText = textOf(prev); if (prevText) return prevText;
-  const group = el.closest(".form-group,.field,.form-item,.row,.control-group");
-  if (group) {
-    const cand = group.querySelector("label,.label,.control-label,.field-label,.title");
-    const t = textOf(cand); if (t) return t;
-  }
-  return null;
-}
-function bestIdentifierRaw(el) {
-  if (el.id) return `#${el.id}`;
-  const name = el.getAttribute("name"); if (name) return `name=${name}`;
-  const aria = el.getAttribute("aria-label"); if (aria) return `aria-label=${aria}`;
-  const ph = el.getAttribute("placeholder"); if (ph) return `placeholder=${ph}`;
-  const dt = el.getAttribute("data-testid"); if (dt) return `data-testid=${dt}`;
-  return null;
-}
-function getIdentifier(el, cssSel, xpSel) {
-  const cand = bestIdentifierRaw(el);
-  if (cand && cand.length <= 36) return cand;
-  const src = (cand || cssSel || xpSel || "") + "|" + location.host + "|" + el.tagName + "|" + getInputType(el);
-  return "h-" + fnv1aHex(src);
-}
+// ---- 배치 큐 ----
+let QUEUE=[]; const MAX_QUEUE=40; const FLUSH_MS=5000;
 
-// ── 큐 & 전송 ─────────────────────────────────────────────
-let QUEUE = [];
-const MAX_QUEUE = 40;
-const FLUSH_MS = 5000;
-
-function sendBatch(reason, events) {
-  chrome.runtime.sendMessage({ type: "BATCH_EVENTS", payload: { reason, events } }).catch(()=>{});
-}
-function flush(reason="interval") {
-  if (!QUEUE.length) return;
-  const batch = QUEUE.splice(0, QUEUE.length);
-  sendBatch(reason, batch);
-}
-
-// ── 입력: “최종값만” 수집 ────────────────────────────────
-const INPUTS = "input, textarea";
-const DEBOUNCE_MS = 600;
-const timers = new WeakMap();
-
-function scheduleFinalRecord(t) {
-  clearTimeout(timers.get(t));
-  timers.set(t, setTimeout(() => {
-    recordInput(t, "change", t.value);
-  }, DEBOUNCE_MS));
-}
-function recordInput(el, action, value, extra={}) {
-  const css = cssPath(el), xp = xPath(el);
-  QUEUE.push({
+function record(el, action, value, extra={}){
+  const css=el?cssPath(el):null, xp=el?xPath(el):null;
+  const rec={
     url: location.href,
     timestamp: now(),
     action,
     selector: { css, xpath: xp },
-    tagName: el.tagName,
+    tagName: el?.tagName || null,
     data: {
-      value: value != null ? maskValue(el, value) : undefined,
-      inputType: getInputType(el),
-      label: getLabel(el),
-      identifier: getIdentifier(el, css, xp),
+      value: value!=null && el ? maskValue(el, value) : (value ?? undefined),
       attributes: {
-        type: el.getAttribute("type") || undefined,
-        name: el.getAttribute("name") || undefined,
-        id: el.id || undefined,
-        class: el.className || undefined
+        type: el?.getAttribute('type') || undefined,
+        name: el?.getAttribute('name') || undefined,
+        id: el?.id || undefined,
+        class: el?.className || undefined
       },
+      a11y: {
+        role: el?.getAttribute?.('role') || null,
+        ariaLabel: el?.getAttribute?.('aria-label') || null,
+        ariaLabelledby: el?.getAttribute?.('aria-labelledby') || null
+      },
+      testids: el ? datasetAttrs(el) : {},
+      form: el ? formContext(el) : null,
+      shadowPath: el ? getShadowPath(el) : [],
+      framePath: getFramePath(window),
+      bounds: el ? bounding(el) : null,
       ...extra
     }
-  });
+  };
+  QUEUE.push(rec);
   if (QUEUE.length >= MAX_QUEUE) flush("max");
 }
-addEventListener("input", (e) => { const t=e.target?.closest(INPUTS); if (t) scheduleFinalRecord(t); }, true);
-addEventListener("blur",  (e) => { const t=e.target?.closest(INPUTS); if (!t) return; clearTimeout(timers.get(t)); recordInput(t,"change",t.value); }, true);
-addEventListener("change",(e) => { const t=e.target?.closest("select"); if (!t) return; const opt=t.selectedOptions?.[0]; recordInput(t,"change",t.value,{selectedText:opt?.text}); }, true);
-addEventListener("keydown",(e) => { if (e.key!=="Enter") return; const t=e.target?.closest(INPUTS); if (!t) return; clearTimeout(timers.get(t)); recordInput(t, "change", t.value); }, true);
+function flush(reason="interval"){
+  if (!QUEUE.length) return;
+  const batch = { reason, events: QUEUE.splice(0, QUEUE.length) };
+  try{ chrome.runtime.sendMessage({ type:"BATCH_EVENTS", payload: batch }); }catch{}
+}
 
-// ── SPA 라우팅(p/a) 포착 ──────────────────────────────────
-(function hookHistory(){
-  function emitRoute(from, to) {
-    sendBatch("route-change", [{
-      url: to, timestamp: now(), action: "route_change",
-      selector: { css: null, xpath: null }, tagName: "ROUTE",
-      data: { from, to, title: document.title }
-    }]);
-  }
-  const wrap = (name) => {
-    const orig = history[name];
-    history[name] = function(...args){
-      const from = location.href;
-      const ret = orig.apply(this, args);
-      setTimeout(()=>{ const to = location.href; if (to!==from) emitRoute(from,to); }, 0);
-      return ret;
-    };
-  };
-  wrap("pushState"); wrap("replaceState");
-  addEventListener("popstate", () => emitRoute("(popstate)", location.href));
-})();
+// ---- 입력: 최종값만 ----
+const INPUTS = "input, textarea";
+const DEBOUNCE_MS = 600;
+const timers = new WeakMap();
 
-// ── 메뉴 수집 (좌측 내비 + 헤더/빵크럼/CTA 포함, 풍부 메타데이터) ───────────
-const NAV_ROOT_SELECTOR = [
-  "nav", "[role='navigation']", "aside",
-  ".snb", ".lnb", ".sidebar", ".side", ".left-menu", ".menu-wrap", ".navigation",
-  "[data-menu-root]"
-].join(",");
-const MENU_ITEM_SELECTOR = `
-  a[href],
-  [role="menuitem"],
-  [role="treeitem"],
-  button,[role="button"],
-  .el-menu-item,.ant-menu-item,
-  [data-az-menu]
-`.replace(/\s+/g," ");
+function scheduleFinalRecord(t){
+  clearTimeout(timers.get(t));
+  timers.set(t, setTimeout(()=>{
+    record(t, "change", t.value);
+  }, DEBOUNCE_MS));
+}
+addEventListener("input",(e)=>{ const t=e.target?.closest(INPUTS); if(t) scheduleFinalRecord(t); },true);
+addEventListener("blur",(e)=>{ const t=e.target?.closest(INPUTS); if(!t) return; clearTimeout(timers.get(t)); record(t,"change",t.value); },true);
+addEventListener("keydown",(e)=>{ if(e.key!=="Enter") return; const t=e.target?.closest(INPUTS); if(!t) return; clearTimeout(timers.get(t)); record(t,"change",t.value); },true);
+addEventListener("change",(e)=>{ const t=e.target?.closest("select"); if(!t) return; const opt=t.selectedOptions?.[0]; record(t,"change",t.value,{ selectedText: opt?.text||null }); },true);
 
-const MENU_DEDUP = new WeakMap();
+// ---- 메뉴 클릭 ----
+const NAV_ROOT_SELECTOR = 'nav,[role="navigation"],aside,.sidebar,.menu,.navigation';
+const MENU_ITEM_SELECTOR = 'a[href], [role="menuitem"], [role="treeitem"], button, [role="button"], .el-menu-item, .ant-menu-item, [data-az-menu]';
+const MENU_DEDUP=new WeakMap();
 function shouldRecord(el){ const n=now(), p=MENU_DEDUP.get(el)||0; MENU_DEDUP.set(el,n); return (n-p)>400; }
-function isLeftNavBox(root) {
-  try {
-    const r = root.getBoundingClientRect();
-    const vw = Math.max(document.documentElement.clientWidth, window.innerWidth || 0) || 1024;
-    return r.left < vw * 0.25 && r.width < Math.min(420, vw * 0.4);
-  } catch { return false; }
-}
-function findNavRoot(el){ return el?.closest(NAV_ROOT_SELECTOR) || null; }
-function leafLabel(item){ const a=item.matches("a[href]")?item:item.querySelector("a[href]"); return textOf(a||item); }
-function sectionLabel(navRoot, item) {
-  if (!navRoot) return null;
-  let li=item.closest("li"), topLi=null;
-  while (li && navRoot.contains(li)) { topLi=li; li=li.parentElement?.closest?.("li")||null; }
-  if (topLi) {
-    const header = topLi.querySelector(":scope > a,:scope > button,:scope > [role='menuitem'],:scope > [role='treeitem'],:scope > .label,:scope > span,:scope > strong");
-    const tx = textOf(header) || textOf(topLi); if (tx) return tx;
-  }
-  const navLabel = navRoot.getAttribute("aria-label") || textOf(navRoot.querySelector("h1,h2,h3,.menu-title,.title,[role='heading']"));
-  return navLabel || null;
-}
-function isLeafMenu(item) {
-  const li = item.closest("li");
-  const href = (item.getAttribute("href")||"").trim();
-  const hasSub = !!(li && li.querySelector(":scope > ul, :scope > ol"));
-  const toggler = !href || href==="#" || href.startsWith("javascript:");
-  return !(hasSub && toggler);
-}
-function menuIdentifier(el){
-  if (el.id) return `#${el.id}`;
-  const name=el.getAttribute("name"); if (name) return `name=${name}`;
-  const aria=el.getAttribute("aria-label"); if (aria) return `aria-label=${aria}`;
-  const dt=el.getAttribute("data-testid"); if (dt) return `data-testid=${dt}`;
-  const key=el.getAttribute("data-az-key"); if (key) return `data-az-key=${key}`;
-  const href=el.getAttribute("href"); if (href) return `href=${href}`;
-  const raw=(el.outerHTML||el.className||"")+"|"+location.pathname;
-  return "m-"+fnv1aHex(raw);
-}
-function menuTrailFrom(el){
-  const trail=[]; let cur=el;
-  while (cur && cur!==document.body) {
-    if (["LI","A","BUTTON","DIV","SPAN","P"].includes(cur.tagName)) {
-      const t=textOf(cur); if (t && !trail.includes(t)) trail.unshift(t);
-    }
-    if (cur.matches("nav,[role='menubar'],[role='navigation'],aside")) break;
-    cur=cur.parentElement;
+function navRootOf(el){ return el?.closest(NAV_ROOT_SELECTOR) || null; }
+function liTrail(el, root){
+  const trail=[]; let cur=el.closest('li,[role="menuitem"],[role="treeitem"],a,button');
+  while (cur && (!root || root.contains(cur))){
+    const t=textOf(cur); if (t && !trail.includes(t)) trail.unshift(t);
+    cur = cur.parentElement?.closest?.('li,[role="menuitem"],[role="treeitem"]') || null;
   }
   return trail.slice(-5);
 }
-
-function recordMenu(el, kind="auto") {
-  const navRoot = findNavRoot(el);
-  const leftNav = navRoot && isLeftNavBox(navRoot);
-  if (navRoot && !isLeafMenu(el)) return; // 토글 제외
-
-  const css = cssPath(el), xp = xPath(el);
-  const href = el.getAttribute("href") || el.getAttribute("data-href") || null;
-
-  const trail = menuTrailFrom(el);
-  const group = leftNav ? sectionLabel(navRoot, el) : null;
-  const leaf  = leafLabel(el);
-  const label = [group, leaf].filter(Boolean).join(" > ") || leaf || group || null;
-
-  const meta = {
-    identifier: menuIdentifier(el),
-    label,
-    href,
-    role: el.getAttribute("role") || null,
-    ariaLabel: el.getAttribute("aria-label") || null,
-    dataset: pickDataAttrs(el),
-    className: el.className || null,
-    tagName: el.tagName,
-    menuTrail: trail,
-    kind: leftNav ? "left_nav" : kind,   // left_nav / header / breadcrumb / cta / auto ...
-    bounds: bounding(el),
-    indexInParent: (function(){ try{ return Array.from(el.parentElement?.children||[]).indexOf(el);}catch{return -1;}})(),
-    pageContext: {
-      title: document.title,
-      path: location.pathname,
-      search: location.search
-    }
+addEventListener("click",(e)=>{
+  const el = e.target?.closest(MENU_ITEM_SELECTOR);
+  if (!el || !shouldRecord(el)) return;
+  const root = navRootOf(el);
+  const payload = {
+    identifier: (el.id?`#${el.id}`:null) || (el.getAttribute('name')?`name=${el.getAttribute('name')}`:null) || (el.getAttribute('data-testid')?`data-testid=${el.getAttribute('data-testid')}`:null) || (el.getAttribute('aria-label')?`aria-label=${el.getAttribute('aria-label')}`:null) || (el.getAttribute('href')?`href=${el.getAttribute('href')}`:null),
+    label: textOf(el),
+    href: el.getAttribute('href')||null,
+    role: el.getAttribute('role')||null,
+    navRoot: root ? cssPath(root) : null,
+    liTrail: liTrail(el, root),
+    dataset: datasetAttrs(el),
+    className: el.className||null,
+    bounds: bounding(el)
   };
-
-  // Service Worker에서 풍부 로그도 보이도록 event.data.meta로 보냄
-  sendBatch("menu-click", [{
+  chrome.runtime.sendMessage({ type:"BATCH_EVENTS", payload:{ reason:"menu-click", events:[{
     url: location.href,
     timestamp: now(),
     action: "menu_click",
-    selector: { css, xpath: xp },
+    selector: { css: cssPath(el), xpath: xPath(el) },
     tagName: el.tagName,
-    data: meta
-  }]);
-}
-
-addEventListener("click", (e) => {
-  const el = e.target?.closest(MENU_ITEM_SELECTOR);
-  if (!el) return;
-  if (!shouldRecord(el)) return;
-  recordMenu(el, "auto");
+    data: payload
+  }] }});
 }, true);
 
-// ── 프론트 보조 훅(원하면 호출): window.dispatchEvent(new CustomEvent('az:menu', {detail:{...}}))
-window.addEventListener("az:menu", (ev) => {
-  const d = ev?.detail || {};
-  const fake = document.createElement("a");
-  if (d.href) fake.setAttribute("href", d.href);
-  if (d["data-az-key"]) fake.setAttribute("data-az-key", d["data-az-key"]);
-  if (d.role) fake.setAttribute("role", d.role);
-  fake.textContent = d.label || d.text || "";
-  document.body.appendChild(fake); // for css/xpath path origination (optional)
-  try {
-    recordMenu(fake, d.kind || "custom");
-  } finally {
-    fake.remove();
+// ---- 라우팅/페이지뷰 ----
+(function hookHistory(){
+  function emit(from,to){
+    chrome.runtime.sendMessage({ type:"BATCH_EVENTS", payload:{ reason:"route-change", events:[{
+      url: to, timestamp: now(), action:"route_change",
+      selector:{ css:null, xpath:null }, tagName:"ROUTE",
+      data:{ from, to, title: document.title, framePath: getFramePath(window) }
+    }] }});
   }
-});
+  const wrap = (name)=>{
+    const orig=history[name];
+    history[name] = function(...args){ const from=location.href; const ret=orig.apply(this,args); setTimeout(()=>{ const to=location.href; if (to!==from) emit(from,to); },0); return ret; };
+  };
+  wrap("pushState"); wrap("replaceState");
+  addEventListener("popstate", ()=> emit("(popstate)", location.href));
+})();
+(function pageView(){
+  const send = ()=> chrome.runtime.sendMessage({ type:"BATCH_EVENTS", payload:{ reason:"page-view", events:[{
+    url: location.href, timestamp: now(), action:"page_view",
+    selector:{ css:null, xpath:null }, tagName:"PAGE",
+    data:{ title: document.title, referrer: document.referrer||null, viewport:{w: innerWidth, h: innerHeight}, framePath: getFramePath(window) }
+  }] }});
+  if (document.readyState==="complete" || document.readyState==="interactive") send();
+  else addEventListener("DOMContentLoaded", send, { once:true });
+})();
 
-// ── 주기/가시성/요청 플러시 ───────────────────────────────
-setInterval(() => flush("interval"), FLUSH_MS);
-document.addEventListener("visibilitychange", () => { if (document.visibilityState === "hidden") flush("hidden"); });
-chrome.runtime.onMessage.addListener((msg) => { if (msg?.type === "FLUSH_REQUEST") flush("request"); });
+// ---- 후행 신호(토스트/모달/헤딩) ----
+(function observePostState(){
+  const mo = new MutationObserver(()=>{
+    const heading = document.querySelector('h1,h2,[role="heading"]');
+    const modal = document.querySelector('[role="dialog"], .modal, .ant-modal, .el-dialog');
+    const toast = document.querySelector('.toast, .ant-message, .el-message, [role="alert"]');
+    if (heading || modal || toast) {
+      const hint = {
+        title: heading ? textOf(heading)?.slice(0,80) : null,
+        modal: modal ? textOf(modal)?.slice(0,120) : null,
+        alert: toast ? textOf(toast)?.slice(0,120) : null
+      };
+      chrome.runtime.sendMessage({ type:"BATCH_EVENTS", payload:{ reason:"post-state", events:[{
+        url: location.href, timestamp: now(), action:"post_state",
+        selector:{ css:null, xpath:null }, tagName:"STATE",
+        data:{ postHints: hint, framePath: getFramePath(window) }
+      }] }});
+    }
+  });
+  mo.observe(document.documentElement, { subtree:true, childList:true });
+})();
+
+// ---- 플러시 트리거 ----
+setInterval(()=> flush("interval"), FLUSH_MS);
+document.addEventListener("visibilitychange", ()=>{ if (document.visibilityState==="hidden") flush("hidden"); });
+addEventListener("pagehide", ()=> flush("pagehide"));
+chrome.runtime.onMessage.addListener((msg)=>{ if (msg?.type==="FLUSH_REQUEST") flush("request"); });

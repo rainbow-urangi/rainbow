@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
-  "name": "Rainbow Extension v0.4",
-  "version": "0.0.4",
-  "description": "DOM 입력/메뉴 이벤트를 수집하고 CSV로 내보냅니다.",
+  "name": "Rainbow Recorder — Robust Capture",
+  "version": "0.7.0",
+  "description": "입력/메뉴/라우팅을 수집하고, 재생 친화 CSV로 내보냅니다. (로케이터/컨텍스트/후행신호/네트워크 강화)",
   "permissions": [
     "storage",
     "webNavigation",
@@ -13,17 +13,19 @@
   ],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
-  "content_scripts": [{
-    "matches": ["<all_urls>"],
-    "js": ["content.js"],
-    "run_at": "document_start",
-    "all_frames": true
-  }],
-  "action": { "default_title": "Export AZ CSV" },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ],
+  "action": { "default_title": "Export CSV (DB+Context)" },
   "commands": {
     "export-csv": {
       "suggested_key": { "default": "Ctrl+Shift+E", "mac": "Command+Shift+E" },
-      "description": "Export AZ CSV"
+      "description": "Export az_db_rows CSV"
     }
   }
 }
