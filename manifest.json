@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Rainbow Recorder — Full Event Capture",
-  "version": "0.9.0",
-  "description": "브라우저 상호작용 전량 + 최종값 수집, 세션/환경/네트워크/메뉴/후행신호, CSV/실시간 업로드 지원",
+  "version": "0.10.0",
+  "description": "브라우저 상호작용 전량+최종값 수집, 메뉴/라우팅/상태 힌트(page_view/route_change/post_state) 포함, 세션·환경·네트워크 매핑, 확장된 AZ_* 컬럼으로 CSV 내보내기",
   "permissions": [
     "storage",
     "webNavigation",
@@ -21,7 +21,7 @@
       "all_frames": true
     }
   ],
-  "action": { "default_title": "Export CSV (DB+Context)" },
+  "action": { "default_title": "Export CSV (AZ Extended)" },
   "commands": {
     "export-csv": {
       "suggested_key": { "default": "Ctrl+Shift+E", "mac": "Command+Shift+E" },

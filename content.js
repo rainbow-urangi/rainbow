@@ -1,4 +1,4 @@
-// content.js — Full Event + Final Value, Session/Env, Menu/State, Rate-limit/Sampling
+// content.js — Full Event + Final Value, Session/Env, Menu/State, Route/PageView (safe)
 
 /***** 설정 *****/
 const CONFIG = {
@@ -137,6 +137,20 @@ function collectEnv(){
   return { os, osver, br, brver, lang, tzoffset, ua, ...scr };
 }
 
+/***** 안전한 세션/환경 getter (PageSession 미초기화 대비) *****/
+function getSafeSessionMeta() {
+  const ps = (typeof PageSession !== "undefined" && PageSession) ? PageSession : null;
+  return {
+    session: {
+      install_id: ps?.installId ?? null,
+      browser_session_id: ps?.browserSessionId ?? null,
+      tab_id: ps?.tabId ?? null,
+      page_session_id: ps?.pageSessionId ?? null
+    },
+    env: ps?.env ?? collectEnv()
+  };
+}
+
 /***** 배치 큐 *****/
 let QUEUE=[]; const MAX_QUEUE=40;
 function flush(reason="interval"){
@@ -170,15 +184,7 @@ function record(el, action, value, extra={}) {
     shadowPath: el ? getShadowPath(el) : [],
     framePath: getFramePath(window),
     bounds: el ? bounding(el) : null,
-    meta: {
-      session: {
-        install_id: PageSession.installId,
-        browser_session_id: PageSession.browserSessionId,
-        tab_id: PageSession.tabId,
-        page_session_id: PageSession.pageSessionId
-      },
-      env: PageSession.env
-    },
+    meta: getSafeSessionMeta(),  // ← 안전하게 세션/환경 주입
     ...extra
   };
 
@@ -271,7 +277,7 @@ if (CONFIG.CAPTURE_MODE!=='FINAL_ONLY'){
   }, true);
 }
 
-/***** 메뉴 클릭(라벨/루트/경로 강화) *****/
+/***** 메뉴 클릭(라벨/루트/경로 + meta/a11y/폼/셰도우/프레임 보강) *****/
 const NAV_ROOT_SELECTOR = 'nav,[role="navigation"],aside,.sidebar,.menu,.navigation';
 const MENU_ITEM_SELECTOR = 'a[href], [role="menuitem"], [role="treeitem"], button, [role="button"], .el-menu-item, .ant-menu-item, [data-az-menu]';
 const MENU_DEDUP = new WeakMap();
@@ -293,6 +299,7 @@ addEventListener("click",(e)=>{
     || el.getAttribute('aria-label')
     || Object.values(datasetAttrs(el)).find(Boolean)
     || textOf(el);
+
   const payload = {
     identifier: (el.id?`#${el.id}`:null)
              || (el.getAttribute('name')?`name=${el.getAttribute('name')}`:null)
@@ -302,15 +309,35 @@ addEventListener("click",(e)=>{
     label: labelFallback || null,
     href: el.getAttribute('href')||null,
     role: el.getAttribute('role')||null,
+    // a11y/attr/testids/form/frame/shadow/meta/title/referrer
+    a11y: {
+      role: el.getAttribute('role') || null,
+      ariaLabel: el.getAttribute('aria-label') || null,
+      ariaLabelledby: el.getAttribute('aria-labelledby') || null
+    },
+    attributes: {
+      type: el.getAttribute('type') || undefined,
+      name: el.getAttribute('name') || undefined,
+      id: el.id || undefined,
+      class: el.className || undefined
+    },
+    testids: datasetAttrs(el),
     navRoot: root ? cssPath(root) : null,
     liTrail: liTrail(el, root),
-    dataset: datasetAttrs(el),
     className: el.className||null,
-    bounds: bounding(el)
+    bounds: bounding(el),
+    framePath: getFramePath(window),
+    shadowPath: getShadowPath(el),
+    form: formContext(el),
+    meta: getSafeSessionMeta(),
+    title: document.title,
+    referrer: document.referrer||null
   };
+
   chrome.runtime.sendMessage({ type:"BATCH_EVENTS", payload:{ reason:"menu-click", events:[{
     url: location.href, timestamp: now(), action:"menu_click",
-    selector:{ css: cssPath(el), xpath: xPath(el) }, tagName: el.tagName, data: payload
+    selector:{ css: cssPath(el), xpath: xPath(el) }, // background에서 보강 유무와 무관
+    tagName: el.tagName, data: payload
   }] }});
 }, true);
 
@@ -320,7 +347,7 @@ addEventListener("click",(e)=>{
     chrome.runtime.sendMessage({ type:"BATCH_EVENTS", payload:{ reason:"route-change", events:[{
       url: to, timestamp: now(), action:"route_change",
       selector:{ css:null, xpath:null }, tagName:"ROUTE",
-      data:{ from, to, title: document.title, framePath: getFramePath(window) }
+      data:{ from, to, title: document.title, framePath: getFramePath(window), meta: getSafeSessionMeta() }
     }] }});
   }
   const wrap = name=>{
@@ -335,7 +362,7 @@ addEventListener("click",(e)=>{
     url: location.href, timestamp: now(), action:"page_view",
     selector:{ css:null, xpath:null }, tagName:"PAGE",
     data:{ title: document.title, referrer: document.referrer||null, viewport:{w: innerWidth, h: innerHeight}, framePath: getFramePath(window),
-           meta:{ session:{ install_id: PageSession.installId, browser_session_id: PageSession.browserSessionId, tab_id: PageSession.tabId, page_session_id: PageSession.pageSessionId }, env: PageSession.env } }
+           meta: getSafeSessionMeta() }
   }] }});
   if (document.readyState==="complete" || document.readyState==="interactive") send();
   else addEventListener("DOMContentLoaded", send, { once:true });
