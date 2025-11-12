@@ -27,5 +27,5 @@
       "suggested_key": { "default": "Ctrl+Shift+E", "mac": "Command+Shift+E" },
       "description": "Export az_db_rows CSV"
     }
-  ]
+  }
 }
