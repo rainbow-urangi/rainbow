@@ -376,3 +376,53 @@ addEventListener("click",(e)=>{
     if (res){ PageSession.browserSessionId=res.browser_session_id || null; PageSession.tabId=res.tab_id ?? null; }
   });
 })();
+
+// ------- 로그인 아이디 저장(폼 제출 시) -------
+(function captureLoginIdOnSubmit(){
+  function isLoginForm(form){
+    return !!form.querySelector('input[type="password"]');
+  }
+  function findUserField(form){
+    const cand = form.querySelector(
+      [
+        'input[type="email"]',
+        'input[name*="user"]',
+        'input[name*="login"]',
+        'input[name*="account"]',
+        'input[name*="id"]',
+        'input[id*="user"]',
+        'input[id*="login"]',
+        'input[id*="account"]',
+        'input[id*="id"]',
+        'input[type="text"]'
+      ].join(',')
+    );
+    return cand || null;
+  }
+  function getUserId(form){
+    const el = findUserField(form);
+    const v = el?.value?.trim();
+    if (!v) return null;
+    return v;
+  }
+
+  // 1) form submit
+  document.addEventListener('submit', (e)=>{
+    const form = e.target;
+    if (!(form instanceof HTMLFormElement)) return;
+    if (!isLoginForm(form)) return;
+    const uid = getUserId(form);
+    if (uid) chrome.storage.local.set({ loginId: uid });
+  }, true);
+
+  // 2) submit 버튼 클릭(일부 사이트는 JS로 제출)
+  document.addEventListener('click', (e)=>{
+    const btn = e.target?.closest('button, input[type="submit"]');
+    if (!btn) return;
+    const form = btn.form || btn.closest('form');
+    if (form && isLoginForm(form)) {
+      const uid = getUserId(form);
+      if (uid) chrome.storage.local.set({ loginId: uid });
+    }
+  }, true);
+})();

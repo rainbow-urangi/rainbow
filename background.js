@@ -1,9 +1,9 @@
 // background.js — Expanded CSV schema, PAGE_VIEW/ROUTE_CHANGE rows, API latency/host, safer IP handling
 
 /***** 업로드/내보내기 설정 *****/
-const REALTIME_UPLOAD = false;
-const INGEST_URL = "https://your.api.example/ingest/batch";
-const INGEST_API_KEY = "";
+const REALTIME_UPLOAD = true;
+const INGEST_URL = "http://34.22.96.191:8080/ingest/batch";
+const INGEST_API_KEY = "9F2A4C7D1E8B0FA3D6C4B1E7A9F03D2";
 
 /***** 유틸 *****/
 const pad=(n,z=2)=>String(n).padStart(z,"0");
@@ -21,6 +21,18 @@ function isSensitiveAttr(attrs){
   return t==="password" || /pass|pwd|ssn|credit|주민|비번/i.test(n);
 }
 const ALLOWED_KEYS = new Set(["Enter","Tab","Escape","Backspace","Delete","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","Home","End","PageUp","PageDown"]);
+// 후보 아이디 추정(비밀번호 제외, email 또는 name/id에 user/login/id/email 단어 포함)
+function guessLoginId(attrs, value) {
+  const v = (typeof value === "string" ? value.trim() : "") || null;
+  if (!v) return null;
+  const type = String(attrs?.type || "").toLowerCase();
+  const name = String(attrs?.name || attrs?.id || "").toLowerCase();
+  if (type === "password") return null;                    // 비밀번호는 제외
+  if (/@/.test(v)) return v;                               // 이메일이면 거의 확실
+  if (/(user|login|account|member|staff|emp|id|userid|username)/i.test(name)) return v;
+  return null;
+}
+
 
 /***** 브라우저 세션 ID 발급 *****/
 const BROWSER_SESSION_ID = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
@@ -260,6 +272,13 @@ function eventToDbRow(ev, tabId, loginId="unknown"){
     const type = (d.attributes?.type || d.inputType || t.toLowerCase() || "").slice(0,32);
     const value = d.value===undefined ? null : d.value;
     const sens = isSensitiveAttr(d.attributes);
+    // lid는 메시지 리스너에서 chrome.storage.local.get("loginId")로 가져온 값
+    if ((!loginId || loginId === "unknown") && maybeLogin) {
+      // ① 현재 행의 AZ_login_id 즉시 치환
+      base.AZ_login_id = maybeLogin;
+      // ② 앞으로의 배치에 쓰이도록 영구 저장(비동기, await 불필요)
+      chrome.storage.local.set({ loginId: maybeLogin }).catch?.(()=>{});
+    }
 
     return {
       ...base,
