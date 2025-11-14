@@ -1,12 +1,18 @@
-// content.js — Full Event + Final Value, Session/Env, Menu/State, Route/PageView (safe)
+// content.js — Full Event + Final Value + SNAPSHOT(before/after) + Session/Env + Login capture
+// (변경점) change/submit/menu_click 시 DOM 스냅샷 동시 수집하여 background로 전달
 
 /***** 설정 *****/
 const CONFIG = {
   CAPTURE_MODE: 'BOTH',     // 'FINAL_ONLY' | 'PER_EVENT' | 'BOTH'
-  KEY_SAMPLING_MS: 120,      // key/input 이벤트 샘플링 간격(ms)
-  BUCKET_RATE: 10,           // 요소/이벤트타입별 초당 허용 이벤트
-  BUCKET_SIZE: 20,           // 버킷 용량
-  FINAL_DEBOUNCE_MS: 600     // 최종값 디바운스
+  KEY_SAMPLING_MS: 120,
+  BUCKET_RATE: 10,
+  BUCKET_SIZE: 20,
+  FINAL_DEBOUNCE_MS: 600
+};
+const SNAPSHOT = {
+  ENABLED: true,
+  AFTER_DELAY_MS: 250,          // 이벤트 후 DOM 안정화 대기
+  MAX_CHARS: 500000             // 스냅샷 클립(문자 수). 필요시 조정
 };
 
 /***** CSS.escape 폴리필 *****/
@@ -95,10 +101,10 @@ function isSensitive(el){
 function uuid(){ return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g,c=>(c^crypto.getRandomValues(new Uint8Array(1))[0]&15>>c/4).toString(16)); }
 
 const PageSession = {
-  installId: null,       // 영구
-  browserSessionId: null,// 브라우저 세션(백그라운드가 발급)
+  installId: null,
+  browserSessionId: null,
   tabId: null,
-  pageSessionId: uuid(), // 탭 내 페이지 세션
+  pageSessionId: uuid(),
   env: null
 };
 
@@ -113,10 +119,9 @@ async function ensureInstallId(){
 function collectEnv(){
   const ua = navigator.userAgent || "";
   const lang = navigator.language || (navigator.languages||[])[0] || null;
-  const tzoffset = new Date().getTimezoneOffset(); // minutes
+  const tzoffset = new Date().getTimezoneOffset();
   const dpr = window.devicePixelRatio || 1;
   const scr = { sw: screen.width, sh: screen.height, vw: innerWidth, vh: innerHeight, dpr };
-  // 간단 파서(정교함보단 존재 여부)
   let os=null, osver=null, br=null, brver=null;
   try{
     if (navigator.userAgentData) {
@@ -137,7 +142,7 @@ function collectEnv(){
   return { os, osver, br, brver, lang, tzoffset, ua, ...scr };
 }
 
-/***** 안전한 세션/환경 getter (PageSession 미초기화 대비) *****/
+/***** 안전한 세션/환경 getter *****/
 function getSafeSessionMeta() {
   const ps = (typeof PageSession !== "undefined" && PageSession) ? PageSession : null;
   return {
@@ -149,6 +154,29 @@ function getSafeSessionMeta() {
     },
     env: ps?.env ?? collectEnv()
   };
+}
+
+/***** DOM 스냅샷 유틸 *****/
+function bestSnapshotRoot(el){
+  try{
+    return el?.closest?.('form,[role="dialog"],[data-reactroot],#app,main,body') || document.body || document.documentElement;
+  }catch{ return document.documentElement; }
+}
+function takeDomSnapshot(el){
+  if (!SNAPSHOT.ENABLED) return null;
+  let root = bestSnapshotRoot(el);
+  let html = (root?.outerHTML) || document.documentElement.outerHTML || "";
+  if (SNAPSHOT.MAX_CHARS && html.length > SNAPSHOT.MAX_CHARS){
+    html = html.slice(0, SNAPSHOT.MAX_CHARS) + '\n<!-- clipped -->';
+  }
+  return html;
+}
+function withDomSnapshot(el, done){
+  const before = takeDomSnapshot(el);
+  setTimeout(()=>{
+    const after = takeDomSnapshot(el);
+    try{ done({ dom_before: before, dom_after: after }); }catch{}
+  }, SNAPSHOT.AFTER_DELAY_MS);
 }
 
 /***** 배치 큐 *****/
@@ -163,7 +191,7 @@ addEventListener("pagehide", ()=> flush("pagehide"));
 document.addEventListener("visibilitychange", ()=>{ if (document.visibilityState==="hidden") flush("hidden"); });
 chrome.runtime.onMessage.addListener((msg)=>{ if (msg?.type==="FLUSH_REQUEST") flush("request"); });
 
-/***** 공통 기록 함수 *****/
+/***** 공통 기록 *****/
 function record(el, action, value, extra={}) {
   const css = el ? cssPath(el) : null, xp = el ? xPath(el) : null;
   const data = {
@@ -184,14 +212,14 @@ function record(el, action, value, extra={}) {
     shadowPath: el ? getShadowPath(el) : [],
     framePath: getFramePath(window),
     bounds: el ? bounding(el) : null,
-    meta: getSafeSessionMeta(),  // ← 안전하게 세션/환경 주입
+    meta: getSafeSessionMeta(),
     ...extra
   };
 
   const rec = {
     url: location.href,
     timestamp: now(),
-    action,                      // 'change' | 'menu_click' | 'event' | ...
+    action,
     selector: { css, xpath: xp },
     tagName: el?.tagName || null,
     data
@@ -214,20 +242,25 @@ function allowEvent(el, type){
   buckets.set(k,b); return false;
 }
 
-/***** 최종값(기존) *****/
-const INPUTS = "input, textarea"; const FINAL_TIMERS = new WeakMap();
+/***** 최종값 + 스냅샷 *****/
+const INPUTS = "input, textarea";
+const FINAL_TIMERS = new WeakMap();
+
 function scheduleFinalRecord(t){
   clearTimeout(FINAL_TIMERS.get(t));
-  FINAL_TIMERS.set(t, setTimeout(()=> record(t,"change", t.value), CONFIG.FINAL_DEBOUNCE_MS));
-}
-if (CONFIG.CAPTURE_MODE!=='PER_EVENT'){
-  addEventListener("input",(e)=>{ const t=e.target?.closest(INPUTS); if(t) scheduleFinalRecord(t); }, true);
-  addEventListener("blur",(e)=>{ const t=e.target?.closest(INPUTS); if(!t) return; clearTimeout(FINAL_TIMERS.get(t)); record(t,"change",t.value); }, true);
-  addEventListener("keydown",(e)=>{ if(e.key!=="Enter") return; const t=e.target?.closest(INPUTS); if(!t) return; clearTimeout(FINAL_TIMERS.get(t)); record(t,"change",t.value); }, true);
-  addEventListener("change",(e)=>{ const t=e.target?.closest("select"); if(!t) return; const opt=t.selectedOptions?.[0]; record(t,"change",t.value,{ selectedText: opt?.text||null }); }, true);
+  FINAL_TIMERS.set(t, setTimeout(()=>{
+    withDomSnapshot(t, snap => record(t,"change", t.value, { snapshot: snap }));
+  }, CONFIG.FINAL_DEBOUNCE_MS));
 }
 
-/***** 전량 이벤트 *****/
+if (CONFIG.CAPTURE_MODE!=='PER_EVENT'){
+  addEventListener("input",(e)=>{ const t=e.target?.closest(INPUTS); if(t) scheduleFinalRecord(t); }, true);
+  addEventListener("blur",(e)=>{ const t=e.target?.closest(INPUTS); if(!t) return; clearTimeout(FINAL_TIMERS.get(t)); withDomSnapshot(t, snap => record(t,"change", t.value, { snapshot: snap })); }, true);
+  addEventListener("keydown",(e)=>{ if(e.key!=="Enter") return; const t=e.target?.closest(INPUTS); if(!t) return; clearTimeout(FINAL_TIMERS.get(t)); withDomSnapshot(t, snap => record(t,"change", t.value, { snapshot: snap })); }, true);
+  addEventListener("change",(e)=>{ const t=e.target?.closest("select"); if(!t) return; const opt=t.selectedOptions?.[0]; withDomSnapshot(t, snap => record(t,"change", t.value, { selectedText: opt?.text||null, snapshot: snap })); }, true);
+}
+
+/***** 전량 이벤트(경량) *****/
 if (CONFIG.CAPTURE_MODE!=='FINAL_ONLY'){
   let lastKeyTs = 0;
   ['keydown','keyup','input'].forEach(evt=>{
@@ -259,7 +292,14 @@ if (CONFIG.CAPTURE_MODE!=='FINAL_ONLY'){
     }, true);
   });
 
-  ['mousedown','mouseup','click','dblclick','contextmenu'].forEach(evt=>{
+  // form submit 자체도 스냅샷(전/후)
+  addEventListener('submit',(e)=>{
+    const f = e.target instanceof HTMLFormElement ? e.target : null;
+    if (!f) return;
+    withDomSnapshot(f, snap => record(f, 'submit', null, { snapshot: snap }));
+  }, true);
+
+  ['mousedown','mouseup','dblclick','contextmenu'].forEach(evt=>{
     addEventListener(evt,(e)=>{
       const t = e.target instanceof Element ? e.target : null;
       if (!t || !allowEvent(t, evt)) return;
@@ -267,17 +307,9 @@ if (CONFIG.CAPTURE_MODE!=='FINAL_ONLY'){
       record(t, 'event', undefined, { instant: p });
     }, true);
   });
-
-  addEventListener('change',(e)=>{
-    const t = e.target instanceof Element ? e.target : null;
-    if (!t || !allowEvent(t,'change')) return;
-    let extra = { type:'change' };
-    if (t.tagName==='SELECT'){ const opt=t.selectedOptions?.[0]; extra.selectedText=opt?.text||null; }
-    record(t, 'event', undefined, { instant: extra });
-  }, true);
 }
 
-/***** 메뉴 클릭(라벨/루트/경로 + meta/a11y/폼/셰도우/프레임 보강) *****/
+/***** 메뉴 클릭(스냅샷 포함) *****/
 const NAV_ROOT_SELECTOR = 'nav,[role="navigation"],aside,.sidebar,.menu,.navigation';
 const MENU_ITEM_SELECTOR = 'a[href], [role="menuitem"], [role="treeitem"], button, [role="button"], .el-menu-item, .ant-menu-item, [data-az-menu]';
 const MENU_DEDUP = new WeakMap();
@@ -300,7 +332,7 @@ addEventListener("click",(e)=>{
     || Object.values(datasetAttrs(el)).find(Boolean)
     || textOf(el);
 
-  const payload = {
+  const payloadBase = {
     identifier: (el.id?`#${el.id}`:null)
              || (el.getAttribute('name')?`name=${el.getAttribute('name')}`:null)
              || (el.getAttribute('data-testid')?`data-testid=${el.getAttribute('data-testid')}`:null)
@@ -309,7 +341,6 @@ addEventListener("click",(e)=>{
     label: labelFallback || null,
     href: el.getAttribute('href')||null,
     role: el.getAttribute('role')||null,
-    // a11y/attr/testids/form/frame/shadow/meta/title/referrer
     a11y: {
       role: el.getAttribute('role') || null,
       ariaLabel: el.getAttribute('aria-label') || null,
@@ -334,14 +365,18 @@ addEventListener("click",(e)=>{
     referrer: document.referrer||null
   };
 
-  chrome.runtime.sendMessage({ type:"BATCH_EVENTS", payload:{ reason:"menu-click", events:[{
-    url: location.href, timestamp: now(), action:"menu_click",
-    selector:{ css: cssPath(el), xpath: xPath(el) }, // background에서 보강 유무와 무관
-    tagName: el.tagName, data: payload
-  }] }});
+  const domBefore = takeDomSnapshot(el);
+  setTimeout(()=>{
+    const payload = { ...payloadBase, snapshot: { dom_before: domBefore, dom_after: takeDomSnapshot(el) } };
+    chrome.runtime.sendMessage({ type:"BATCH_EVENTS", payload:{ reason:"menu-click", events:[{
+      url: location.href, timestamp: now(), action:"menu_click",
+      selector:{ css: cssPath(el), xpath: xPath(el) },
+      tagName: el.tagName, data: payload
+    }] }});
+  }, SNAPSHOT.AFTER_DELAY_MS);
 }, true);
 
-/***** 라우팅/페이지뷰 *****/
+/***** 라우팅/페이지뷰(기존) *****/
 (function hookHistory(){
   function emit(from,to){
     chrome.runtime.sendMessage({ type:"BATCH_EVENTS", payload:{ reason:"route-change", events:[{
@@ -368,61 +403,43 @@ addEventListener("click",(e)=>{
   else addEventListener("DOMContentLoaded", send, { once:true });
 })();
 
-/***** 세션/환경 초기화 및 백그라운드와 핸드셰이크 *****/
+/***** 로그인 ID 추정/저장 *****/
+function guessLoginId(){
+  try{
+    const candidates = [...document.querySelectorAll('input,textarea')];
+    const score = f =>{
+      const n=(f.getAttribute('name')||'').toLowerCase();
+      const i=(f.id||'').toLowerCase();
+      const p=(f.getAttribute('placeholder')||'').toLowerCase();
+      const t=(f.type||'').toLowerCase();
+      let s=0;
+      if (/(login|userid|user|email|account|아이디|사번)/.test(n+i+p)) s+=2;
+      if (t==='text' || t==='email') s+=1;
+      if ((f.value||'').length>=3) s+=2;
+      return s;
+    };
+    const field = candidates.sort((a,b)=>score(b)-score(a))[0];
+    const val = (field?.value||'').trim();
+    if (val) chrome.storage.local.set({ loginId: val.slice(0,128) });
+  }catch{}
+}
+function captureLoginIdOnSubmit(){
+  addEventListener('submit', (e)=>{
+    const f = e.target instanceof HTMLFormElement ? e.target : null;
+    if (!f) return;
+    const idField = f.querySelector('input[type="text"],input[type="email"],input[name*="id"],input[name*="user"],input[name*="login"]');
+    const val = (idField?.value||'').trim();
+    if (val) chrome.storage.local.set({ loginId: val.slice(0,128) });
+  }, true);
+}
+
+/***** 초기화 및 백그라운드 핸드셰이크 *****/
 (async function init(){
   await ensureInstallId();
   PageSession.env = collectEnv();
   chrome.runtime.sendMessage({ type:"HELLO" }, (res)=>{
     if (res){ PageSession.browserSessionId=res.browser_session_id || null; PageSession.tabId=res.tab_id ?? null; }
   });
-})();
-
-// ------- 로그인 아이디 저장(폼 제출 시) -------
-(function captureLoginIdOnSubmit(){
-  function isLoginForm(form){
-    return !!form.querySelector('input[type="password"]');
-  }
-  function findUserField(form){
-    const cand = form.querySelector(
-      [
-        'input[type="email"]',
-        'input[name*="user"]',
-        'input[name*="login"]',
-        'input[name*="account"]',
-        'input[name*="id"]',
-        'input[id*="user"]',
-        'input[id*="login"]',
-        'input[id*="account"]',
-        'input[id*="id"]',
-        'input[type="text"]'
-      ].join(',')
-    );
-    return cand || null;
-  }
-  function getUserId(form){
-    const el = findUserField(form);
-    const v = el?.value?.trim();
-    if (!v) return null;
-    return v;
-  }
-
-  // 1) form submit
-  document.addEventListener('submit', (e)=>{
-    const form = e.target;
-    if (!(form instanceof HTMLFormElement)) return;
-    if (!isLoginForm(form)) return;
-    const uid = getUserId(form);
-    if (uid) chrome.storage.local.set({ loginId: uid });
-  }, true);
-
-  // 2) submit 버튼 클릭(일부 사이트는 JS로 제출)
-  document.addEventListener('click', (e)=>{
-    const btn = e.target?.closest('button, input[type="submit"]');
-    if (!btn) return;
-    const form = btn.form || btn.closest('form');
-    if (form && isLoginForm(form)) {
-      const uid = getUserId(form);
-      if (uid) chrome.storage.local.set({ loginId: uid });
-    }
-  }, true);
+  guessLoginId();
+  captureLoginIdOnSubmit();
 })();

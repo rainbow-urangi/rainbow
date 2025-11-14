@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Rainbow Recorder — Full Event Capture",
-  "version": "0.10.0",
-  "description": "브라우저 상호작용 전량+최종값 수집, 메뉴/라우팅/상태 힌트(page_view/route_change/post_state) 포함, 세션·환경·네트워크 매핑, 확장된 AZ_* 컬럼으로 CSV 내보내기",
+  "version": "0.11.0",
+  "description": "브라우저 이벤트 수집",
   "permissions": [
     "storage",
     "webNavigation",

@@ -1,5 +1,4 @@
-// background.js — Expanded CSV schema, PAGE_VIEW/ROUTE_CHANGE rows, API latency/host, safer IP handling
-
+// background.js — Expanded CSV + SNAPSHOT pass-through + API latency/host
 /***** 업로드/내보내기 설정 *****/
 const REALTIME_UPLOAD = true;
 const INGEST_URL = "http://34.22.96.191:8080/ingest/batch";
@@ -14,27 +13,15 @@ function downloadText(filename, text, mime="text/csv"){ const url="data:"+mime+"
 function sameHost(u1,u2){ try{ return new URL(u1).host===new URL(u2).host; }catch{return true;} }
 function urlPath(u){ try{ return new URL(u).pathname; }catch{return null;} }
 function urlHost(u){ try{ return new URL(u).host; }catch{return null;} }
-function firstNonEmpty(...a){ return a.find(x=>x!=null && String(x).trim()!=="") ?? null; }
 function pickTestId(obj){ if(!obj) return null; return obj["data-testid"]||obj["data-test-id"]||obj["data-qa"]||obj["data-cy"]||null; }
+function firstNonEmpty(...a){ return a.find(x=>x!=null && String(x).trim()!=="") ?? null; }
 function isSensitiveAttr(attrs){
   const t=(attrs?.type||"").toLowerCase(); const n=(attrs?.name||"").toLowerCase();
   return t==="password" || /pass|pwd|ssn|credit|주민|비번/i.test(n);
 }
 const ALLOWED_KEYS = new Set(["Enter","Tab","Escape","Backspace","Delete","ArrowLeft","ArrowRight","ArrowUp","ArrowDown","Home","End","PageUp","PageDown"]);
-// 후보 아이디 추정(비밀번호 제외, email 또는 name/id에 user/login/id/email 단어 포함)
-function guessLoginId(attrs, value) {
-  const v = (typeof value === "string" ? value.trim() : "") || null;
-  if (!v) return null;
-  const type = String(attrs?.type || "").toLowerCase();
-  const name = String(attrs?.name || attrs?.id || "").toLowerCase();
-  if (type === "password") return null;                    // 비밀번호는 제외
-  if (/@/.test(v)) return v;                               // 이메일이면 거의 확실
-  if (/(user|login|account|member|staff|emp|id|userid|username)/i.test(name)) return v;
-  return null;
-}
 
-
-/***** 브라우저 세션 ID 발급 *****/
+/***** 브라우저 세션 ID *****/
 const BROWSER_SESSION_ID = crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse)=>{
   if (msg?.type==="HELLO"){
@@ -76,28 +63,7 @@ chrome.webRequest.onErrorOccurred?.addListener((details)=>{
   }
 },{ urls:["<all_urls>"] });
 
-/***** STATE(후행신호) 과다 억제 *****/
-const lastStateByTab = new Map(); // tabId -> { title, modal, alert, t }
-const POST_STATE_DEBOUNCE_MS = 600;
-function meaningful(prev, cur){
-  if (!prev) return true;
-  const keys=["title","modal","alert"];
-  return keys.some(k => (cur?.[k]||null) && (cur?.[k]||null)!==(prev?.[k]||null));
-}
-
-/***** 메뉴 경로 정규화 *****/
-function normalizeMenuTrail(label, liTrail=[]){
-  const clean = Array.isArray(liTrail) ? liTrail.filter(Boolean).map(s=>String(s).trim()) : [];
-  if (!clean.length) return label ? [label] : null;
-  if (clean.length===1){ const section=clean[0]; if (!label || section.includes(label)) return [section]; return [section, label]; }
-  const section = clean[clean.length-1];
-  const fallbackItem = clean.find(s=> s!==section && s.length<=30) || section;
-  const last = (label && !section.includes(label)) ? label : fallbackItem;
-  if (section===last) return [section];
-  return [section, last];
-}
-
-/***** 버퍼/CSV/업로드 *****/
+/***** 버퍼/업로드 *****/
 let DB_BUFFER = [];
 
 async function realtimeUpload(rows, reason){
@@ -106,7 +72,7 @@ async function realtimeUpload(rows, reason){
     const body = JSON.stringify({ reason, rows, ts: Date.now() });
     const headers = { "Content-Type":"application/json" };
     if (INGEST_API_KEY) headers["x-api-key"]=INGEST_API_KEY;
-    const res = await fetch(INGEST_URL, { method:"POST", headers, body, keepalive:true });
+    const res = await fetch(INGEST_URL, { method:"POST", headers, body });
     if (!res.ok) console.warn("[INGEST] non-200", res.status);
   }catch(e){ console.warn("[INGEST] failed", e); }
 }
@@ -116,23 +82,25 @@ function logAndBuffer(reason, rows){
   console.group(`[DB ROWS] reason=${reason} count=${rows.length}`);
   try{
     console.table(rows, [
-      "AZ_event_action","AZ_event_subtype","AZ_url","AZ_url_host","AZ_url_path","AZ_element_type","AZ_element_uid","AZ_element_label",
-      "AZ_api_method","AZ_api_status","AZ_api_path","AZ_api_latency_ms","AZ_login_id","AZ_event_time"
+      "AZ_event_action","AZ_event_subtype","AZ_url","AZ_url_host","AZ_url_path",
+      "AZ_element_type","AZ_element_uid","AZ_element_label",
+      "AZ_api_method","AZ_api_status","AZ_api_path","AZ_api_latency_ms",
+      "AZ_login_id","AZ_event_time"
     ]);
   }finally{ console.groupEnd(); }
   DB_BUFFER.push(...rows);
   realtimeUpload(rows, reason);
 }
 
-/***** CSV 헤더(기존 19개 + 확장) *****/
+/***** CSV 헤더(확장) *****/
 const CSV_HEADERS = [
-  // 기존
+  // 기존 19개
   "AZ_api_url","AZ_api_method","AZ_api_status","AZ_api_path",
   "AZ_ip_address","AZ_url","AZ_login_id","AZ_event_time",
   "AZ_element_uid","AZ_element_type","AZ_element_label","AZ_data",
   "AZ_frame_path","AZ_shadow_path","AZ_form_selector",
   "AZ_locators_json","AZ_nav_root","AZ_menu_li_trail","AZ_post_hints",
-  // 신규(뒤에 추가)
+  // 확장 메타
   "AZ_event_action","AZ_event_subtype",
   "AZ_page_title","AZ_referrer","AZ_viewport_w","AZ_viewport_h",
   "AZ_url_host","AZ_url_path",
@@ -143,7 +111,9 @@ const CSV_HEADERS = [
   "AZ_form_name","AZ_form_action","AZ_data_testid","AZ_input_length","AZ_is_sensitive",
   "AZ_key","AZ_key_mods",
   "AZ_menu_section","AZ_menu_item",
-  "AZ_route_from","AZ_route_to"
+  "AZ_route_from","AZ_route_to",
+  // (신규) 스냅샷
+  "AZ_dom_before","AZ_dom_after","AZ_api_response_body"
 ];
 
 function exportDbCsv(){
@@ -160,7 +130,7 @@ function safeExportAllCsv(){
 chrome.action.onClicked.addListener(()=> safeExportAllCsv());
 chrome.commands.onCommand.addListener((cmd)=>{ if (cmd==="export-csv") safeExportAllCsv(); });
 
-/***** 이벤트 → 표준 행 변환 *****/
+/***** 공통 변환 *****/
 function attachApi(url, tabId){
   const api = lastApiByTab.get(tabId) || {};
   const same = api.url && sameHost(api.url, url);
@@ -179,7 +149,7 @@ function baseCommon(ev, tabId, loginId){
   const ts  = ev.timestamp || Date.now();
   const sess= d.meta?.session || {};
   return {
-    AZ_ip_address: null, // 수집 불가 → 빈값 유지
+    AZ_ip_address: null, // 확장에서는 수집 불가(서버에서 채우기)
     AZ_url: url, AZ_url_host: urlHost(url), AZ_url_path: urlPath(url),
     AZ_login_id: loginId, AZ_event_time: dt0(ts),
     AZ_selector_css: ev.selector?.css || null, AZ_selector_xpath: ev.selector?.xpath || null,
@@ -200,18 +170,20 @@ function baseCommon(ev, tabId, loginId){
     AZ_locators_json: JSON.stringify({
       a11y: d.a11y || null, testids: d.testids || d.dataset || null, attrs: d.attributes || null, bounds: d.bounds || null,
       session: d.meta?.session || null, env: d.meta?.env || null
-    })
+    }),
+    // snapshot pass-through
+    AZ_dom_before: d.snapshot?.dom_before ?? null,
+    AZ_dom_after: d.snapshot?.dom_after ?? null,
+    AZ_api_response_body: d.snapshot?.api_response_body ?? null
   };
 }
 
+/***** 이벤트 → AZ 행 변환 *****/
 function eventToDbRow(ev, tabId, loginId="unknown"){
   const a = ev.action;
   const t = (ev.tagName||"").toUpperCase();
   const d = ev.data || {};
   const url = ev.url || "";
-  const ts  = ev.timestamp || Date.now();
-
-  // 공통 + API 첨부
   const base = { ...baseCommon(ev, tabId, loginId), ...attachApi(url, tabId),
     AZ_element_uid: (d.identifier || ev.selector?.css || ev.selector?.xpath || "").toString().slice(0,256),
     AZ_element_type: null, AZ_element_label: null, AZ_data: null,
@@ -225,45 +197,65 @@ function eventToDbRow(ev, tabId, loginId="unknown"){
   // 메뉴 클릭
   if (a==="menu_click"){
     const label = d.label || null;
-    const compact = [
-      d.href ? `href=${d.href}` : null,
-      d.liTrail?.length ? `trail=${(d.liTrail||[]).join(" > ")}` : null,
-      d.role ? `role=${d.role}` : null
-    ].filter(Boolean).join(" | ").slice(0,1000);
-
-    const normTrail = normalizeMenuTrail(label, d.liTrail || []);
-    if (normTrail){
-      base.AZ_menu_section = normTrail[0] || null;
-      base.AZ_menu_item    = normTrail[1] || null;
-      base.AZ_menu_li_trail = JSON.stringify(normTrail);
-    } else if (d.liTrail?.length){
-      base.AZ_menu_li_trail = JSON.stringify(d.liTrail);
-    }
+    const liTrail = Array.isArray(d.liTrail)?d.liTrail:[];
+    // 간단 정규화(섹션/아이템)
+    const section = liTrail.slice(-1)[0] || label || null;
+    const item = label && section && !section.includes(label) ? label : null;
 
     return {
       ...base,
       AZ_element_type: "menu",
       AZ_element_label: label,
-      AZ_data: compact,
+      AZ_data: [
+        d.href ? `href=${d.href}` : null,
+        liTrail.length ? `trail=${liTrail.join(" > ")}` : null,
+        d.role ? `role=${d.role}` : null
+      ].filter(Boolean).join(" | ").slice(0,1000),
+      AZ_menu_li_trail: liTrail.length ? JSON.stringify(liTrail) : null,
+      AZ_menu_section: section || null,
+      AZ_menu_item: item || null,
       AZ_page_title: d.title || null
     };
   }
 
-  // 후행신호 STATE
-  if (a==="post_state"){
-    const cur = d.postHints || null;
-    const last = lastStateByTab.get(tabId);
-    const now = Date.now();
-    const elapsed = now - (last?.t || 0);
-    if (!meaningful(last, cur) || elapsed < POST_STATE_DEBOUNCE_MS) return null;
-    lastStateByTab.set(tabId, { ...cur, t: now });
-
+  // 페이지 뷰
+  if (a==="page_view"){
+    const vp = d.viewport || {};
+    const sess = d.meta?.session || {};
     return {
       ...base,
-      AZ_element_uid: "STATE",
-      AZ_element_type: "state",
-      AZ_event_subtype: "state",
-      AZ_post_hints: JSON.stringify(cur || null)
+      AZ_element_uid: "PAGE",
+      AZ_element_type: "page",
+      AZ_page_title: d.title || null,
+      AZ_referrer: d.referrer || null,
+      AZ_viewport_w: vp.w ?? null,
+      AZ_viewport_h: vp.h ?? null,
+      AZ_session_install_id: sess.install_id || base.AZ_session_install_id,
+      AZ_session_browser_id: sess.browser_session_id || base.AZ_session_browser_id,
+      AZ_session_tab_id: (sess.tab_id ?? base.AZ_session_tab_id),
+      AZ_session_page_id: sess.page_session_id || base.AZ_session_page_id
+    };
+  }
+
+  // 라우팅
+  if (a==="route_change"){
+    return {
+      ...base,
+      AZ_element_uid: "ROUTE",
+      AZ_element_type: "route",
+      AZ_event_subtype: "spa",
+      AZ_page_title: d.title || null,
+      AZ_route_from: d.from || null,
+      AZ_route_to: d.to || null
+    };
+  }
+
+  // form submit (스냅샷 포함)
+  if (a==="submit"){
+    return {
+      ...base,
+      AZ_element_type: "event",
+      AZ_event_subtype: "submit"
     };
   }
 
@@ -272,14 +264,6 @@ function eventToDbRow(ev, tabId, loginId="unknown"){
     const type = (d.attributes?.type || d.inputType || t.toLowerCase() || "").slice(0,32);
     const value = d.value===undefined ? null : d.value;
     const sens = isSensitiveAttr(d.attributes);
-    // lid는 메시지 리스너에서 chrome.storage.local.get("loginId")로 가져온 값
-    if ((!loginId || loginId === "unknown") && maybeLogin) {
-      // ① 현재 행의 AZ_login_id 즉시 치환
-      base.AZ_login_id = maybeLogin;
-      // ② 앞으로의 배치에 쓰이도록 영구 저장(비동기, await 불필요)
-      chrome.storage.local.set({ loginId: maybeLogin }).catch?.(()=>{});
-    }
-
     return {
       ...base,
       AZ_element_type: type,
@@ -290,7 +274,7 @@ function eventToDbRow(ev, tabId, loginId="unknown"){
     };
   }
 
-  // 전량 이벤트(event)
+  // 전량 이벤트
   if (a==="event"){
     const payload = d.instant || {};
     let key=null, mods=null, subtype = payload.type || null, inputLen=null;
@@ -311,38 +295,6 @@ function eventToDbRow(ev, tabId, loginId="unknown"){
     };
   }
 
-  // 페이지 뷰(page_view)
-  if (a==="page_view"){
-    const vp = d.viewport || {};
-    const sess = d.meta?.session || {};
-    return {
-      ...base,
-      AZ_element_uid: "PAGE",
-      AZ_element_type: "page",
-      AZ_page_title: d.title || null,
-      AZ_referrer: d.referrer || null,
-      AZ_viewport_w: vp.w ?? null,
-      AZ_viewport_h: vp.h ?? null,
-      AZ_session_install_id: sess.install_id || base.AZ_session_install_id,
-      AZ_session_browser_id: sess.browser_session_id || base.AZ_session_browser_id,
-      AZ_session_tab_id: (sess.tab_id ?? base.AZ_session_tab_id),
-      AZ_session_page_id: sess.page_session_id || base.AZ_session_page_id
-    };
-  }
-
-  // 라우트 변경(route_change)
-  if (a==="route_change"){
-    return {
-      ...base,
-      AZ_element_uid: "ROUTE",
-      AZ_element_type: "route",
-      AZ_event_subtype: "spa",
-      AZ_page_title: d.title || null,
-      AZ_route_from: d.from || null,
-      AZ_route_to: d.to || null
-    };
-  }
-
   return null;
 }
 
@@ -352,10 +304,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse)=>{
     if (msg?.type !== "BATCH_EVENTS") return;
     const reason = msg.payload?.reason || "";
     const events = Array.isArray(msg.payload?.events) ? msg.payload.events : [];
-
     const { loginId } = await chrome.storage.local.get("loginId");
     const lid = (typeof loginId==="string" && loginId.trim()) ? loginId.trim() : "unknown";
-
     const tabId = sender?.tab?.id ?? -1;
     const rows=[];
     for (const ev of events){
