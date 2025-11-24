@@ -1,445 +1,489 @@
-// content.js — Full Event + Final Value + SNAPSHOT(before/after) + Session/Env + Login capture
-// (변경점) change/submit/menu_click 시 DOM 스냅샷 동시 수집하여 background로 전달
+// content.js — Rows emitter with snapshots, final-value debounce, menu trail, SPA routing
+// - Sends fully-formed AZ_* rows directly via { type:'BATCH_EVENTS', rows }
+// - Captures loginId and includes AZ_login_id in each row
+// - Includes a11y/testids/attrs/bounds/session/env in AZ_locators_json (object; server handles both obj/string)
 
-/***** 설정 *****/
-const CONFIG = {
-  CAPTURE_MODE: 'BOTH',     // 'FINAL_ONLY' | 'PER_EVENT' | 'BOTH'
-  KEY_SAMPLING_MS: 120,
-  BUCKET_RATE: 10,
-  BUCKET_SIZE: 20,
-  FINAL_DEBOUNCE_MS: 600
-};
-const SNAPSHOT = {
-  ENABLED: true,
-  AFTER_DELAY_MS: 250,          // 이벤트 후 DOM 안정화 대기
-  MAX_CHARS: 500000             // 스냅샷 클립(문자 수). 필요시 조정
-};
+(() => {
+  // ───────────────── Config ─────────────────
+  const CONFIG = {
+    CAPTURE_MODE: 'BOTH',       // 'FINAL_ONLY' | 'PER_EVENT' | 'BOTH'
+    KEY_SAMPLING_MS: 120,
+    FINAL_DEBOUNCE_MS: 600
+  };
+  const SNAPSHOT = {
+    ENABLED: true,
+    AFTER_DELAY_MS: 250,
+    MAX_CHARS: 500000
+  };
 
-/***** CSS.escape 폴리필 *****/
-(function ensureCssEscape(){
+  // CSS.escape polyfill
   if (typeof CSS === "undefined") window.CSS = {};
   if (typeof CSS.escape !== "function") {
     CSS.escape = s => String(s).replace(/[^a-zA-Z0-9_\-]/g, ch => `\\${ch}`);
   }
-})();
 
-/***** 유틸 *****/
-const now = () => Date.now();
-const textOf = n => (n?.textContent || "").replace(/\s+/g," ").trim() || null;
+  // ───────────────── IDs/State ─────────────────
+  const INSTALL_KEY = 'AZ_INSTALL_ID';
+  const PAGE_SESSION_ID = crypto?.randomUUID?.() || (Date.now() + '-' + Math.random().toString(16).slice(2));
+  window.__AZ_PAGE_SESSION_ID = PAGE_SESSION_ID;
 
-function cssPath(el){
-  if (!(el instanceof Element)) return "";
-  if (el.id) return `#${CSS.escape(el.id)}`;
-  const parts=[];
-  while (el && el.nodeType===1 && parts.length<8){
-    let part = el.nodeName.toLowerCase();
-    if (el.classList.length) part += "."+[...el.classList].map(CSS.escape).join(".");
-    const sib=[...(el.parentNode?.children||[])].filter(x=>x.nodeName===el.nodeName);
-    if (sib.length>1) part += `:nth-of-type(${sib.indexOf(el)+1})`;
-    parts.unshift(part); el=el.parentElement;
-  }
-  return parts.join(" > ");
-}
-function xPath(el){
-  if (!(el instanceof Element)) return "";
-  if (el.id) return `//*[@id="${el.id}"]`;
-  const segs=[];
-  for (; el && el.nodeType===1; el=el.parentNode){
-    let i=1; for(let s=el.previousSibling; s; s=s.previousSibling)
-      if (s.nodeType===1 && s.nodeName===el.nodeName) i++;
-    segs.unshift(`${el.nodeName.toLowerCase()}[${i}]`);
-  }
-  return "/"+segs.join("/");
-}
-function datasetAttrs(el, prefix='data-'){
-  const out={}; if(!el?.attributes) return out;
-  for (const a of el.attributes) if (a.name.startsWith(prefix)) out[a.name]=String(a.value).slice(0,500);
-  return out;
-}
-function formContext(el){
-  const f = el?.closest?.('form');
-  return f ? { selector: cssPath(f), id: f.id||null, name: f.getAttribute('name')||null, action: f.getAttribute('action')||null } : null;
-}
-function bounding(el){
-  try{
-    const r=el.getBoundingClientRect();
-    return { x:Math.round(r.x), y:Math.round(r.y), w:Math.round(r.width), h:Math.round(r.height) };
-  }catch{ return null; }
-}
-function getShadowPath(el){
-  const chain=[]; let node=el;
-  while (node){
-    const root = node.getRootNode?.();
-    if (root && root.host){ chain.unshift(cssPath(root.host)); node=root.host; }
-    else node=node.parentElement;
-  }
-  return chain;
-}
-function getFramePath(win){
-  try{
-    const chain=[]; let w=win;
-    while (w && w.frameElement){ chain.unshift(cssPath(w.frameElement)); w=w.parent; }
-    return chain;
-  }catch{ return []; }
-}
-function maskValue(el, v){
-  const type=(el?.getAttribute?.('type')||"").toLowerCase();
-  const name=(el?.getAttribute?.('name')||"").toLowerCase();
-  if (type==="password" || /pass|pwd|ssn|credit|주민|비번/i.test(name)) return "*****";
-  if (typeof v==="string" && v.includes("@")){
-    const [id,dom]=v.split("@"); return (id?.slice(0,2)||"*")+"***@"+(dom?.split(".")[0]?.[0]||"*")+"***";
-  }
-  return v;
-}
-function isSensitive(el){
-  const type=(el?.getAttribute?.('type')||"").toLowerCase();
-  const name=(el?.getAttribute?.('name')||"").toLowerCase();
-  return type==="password" || /pass|pwd|ssn|credit|주민|비번/i.test(name);
-}
-
-/***** 세션/환경 *****/
-function uuid(){ return ([1e7]+-1e3+-4e3+-8e3+-1e11).replace(/[018]/g,c=>(c^crypto.getRandomValues(new Uint8Array(1))[0]&15>>c/4).toString(16)); }
-
-const PageSession = {
-  installId: null,
-  browserSessionId: null,
-  tabId: null,
-  pageSessionId: uuid(),
-  env: null
-};
-
-async function ensureInstallId(){
-  return new Promise(res=>{
-    chrome.storage.local.get(['install_id'], r=>{
-      if (r.install_id) { PageSession.installId=r.install_id; return res(r.install_id); }
-      const id=uuid(); chrome.storage.local.set({install_id:id}, ()=>{ PageSession.installId=id; res(id); });
-    });
-  });
-}
-function collectEnv(){
-  const ua = navigator.userAgent || "";
-  const lang = navigator.language || (navigator.languages||[])[0] || null;
-  const tzoffset = new Date().getTimezoneOffset();
-  const dpr = window.devicePixelRatio || 1;
-  const scr = { sw: screen.width, sh: screen.height, vw: innerWidth, vh: innerHeight, dpr };
-  let os=null, osver=null, br=null, brver=null;
-  try{
-    if (navigator.userAgentData) {
-      br = navigator.userAgentData.brands?.[0]?.brand || 'Chromium';
-      brver = navigator.userAgentData.brands?.[0]?.version || null;
-      os = navigator.userAgentData.platform || null;
-    } else {
-      if (/Windows NT/.test(ua)) os='Windows';
-      else if (/Mac OS X/.test(ua)) os='macOS';
-      else if (/Linux/.test(ua)) os='Linux';
-      else if (/Android/.test(ua)) os='Android';
-      else if (/iPhone|iPad|iPod/.test(ua)) os='iOS';
-      if (/Chrome\/([\d.]+)/.exec(ua)) { br='Chrome'; brver=RegExp.$1; }
-      else if (/Edg\/([\d.]+)/.exec(ua)) { br='Edge'; brver=RegExp.$1; }
-      else if (/Firefox\/([\d.]+)/.exec(ua)) { br='Firefox'; brver=RegExp.$1; }
-    }
-  }catch{}
-  return { os, osver, br, brver, lang, tzoffset, ua, ...scr };
-}
-
-/***** 안전한 세션/환경 getter *****/
-function getSafeSessionMeta() {
-  const ps = (typeof PageSession !== "undefined" && PageSession) ? PageSession : null;
-  return {
-    session: {
-      install_id: ps?.installId ?? null,
-      browser_session_id: ps?.browserSessionId ?? null,
-      tab_id: ps?.tabId ?? null,
-      page_session_id: ps?.pageSessionId ?? null
-    },
-    env: ps?.env ?? collectEnv()
-  };
-}
-
-/***** DOM 스냅샷 유틸 *****/
-function bestSnapshotRoot(el){
-  try{
-    return el?.closest?.('form,[role="dialog"],[data-reactroot],#app,main,body') || document.body || document.documentElement;
-  }catch{ return document.documentElement; }
-}
-function takeDomSnapshot(el){
-  if (!SNAPSHOT.ENABLED) return null;
-  let root = bestSnapshotRoot(el);
-  let html = (root?.outerHTML) || document.documentElement.outerHTML || "";
-  if (SNAPSHOT.MAX_CHARS && html.length > SNAPSHOT.MAX_CHARS){
-    html = html.slice(0, SNAPSHOT.MAX_CHARS) + '\n<!-- clipped -->';
-  }
-  return html;
-}
-function withDomSnapshot(el, done){
-  const before = takeDomSnapshot(el);
-  setTimeout(()=>{
-    const after = takeDomSnapshot(el);
-    try{ done({ dom_before: before, dom_after: after }); }catch{}
-  }, SNAPSHOT.AFTER_DELAY_MS);
-}
-
-/***** 배치 큐 *****/
-let QUEUE=[]; const MAX_QUEUE=40;
-function flush(reason="interval"){
-  if (!QUEUE.length) return;
-  const batch = { reason, events: QUEUE.splice(0, QUEUE.length) };
-  try{ chrome.runtime.sendMessage({ type:"BATCH_EVENTS", payload: batch }); }catch{}
-}
-setInterval(()=> flush("interval"), 5000);
-addEventListener("pagehide", ()=> flush("pagehide"));
-document.addEventListener("visibilitychange", ()=>{ if (document.visibilityState==="hidden") flush("hidden"); });
-chrome.runtime.onMessage.addListener((msg)=>{ if (msg?.type==="FLUSH_REQUEST") flush("request"); });
-
-/***** 공통 기록 *****/
-function record(el, action, value, extra={}) {
-  const css = el ? cssPath(el) : null, xp = el ? xPath(el) : null;
-  const data = {
-    value: (value!==undefined && el) ? maskValue(el, value) : (value ?? undefined),
-    attributes: {
-      type: el?.getAttribute?.('type') || undefined,
-      name: el?.getAttribute?.('name') || undefined,
-      id: el?.id || undefined,
-      class: el?.className || undefined
-    },
-    a11y: {
-      role: el?.getAttribute?.('role') || null,
-      ariaLabel: el?.getAttribute?.('aria-label') || null,
-      ariaLabelledby: el?.getAttribute?.('aria-labelledby') || null
-    },
-    testids: el ? datasetAttrs(el) : {},
-    form: el ? formContext(el) : null,
-    shadowPath: el ? getShadowPath(el) : [],
-    framePath: getFramePath(window),
-    bounds: el ? bounding(el) : null,
-    meta: getSafeSessionMeta(),
-    ...extra
-  };
-
-  const rec = {
-    url: location.href,
-    timestamp: now(),
-    action,
-    selector: { css, xpath: xp },
-    tagName: el?.tagName || null,
-    data
-  };
-  QUEUE.push(rec);
-  if (QUEUE.length>=MAX_QUEUE) flush("max");
-}
-
-/***** 레이트리밋/샘플링 *****/
-const buckets = new WeakMap();
-function allowEvent(el, type){
-  const k = el || document.body;
-  let b = buckets.get(k);
-  const t = now();
-  if (!b) b = { t, tokens: CONFIG.BUCKET_SIZE };
-  const dt = Math.max(0, t - b.t)/1000;
-  b.tokens = Math.min(CONFIG.BUCKET_SIZE, b.tokens + dt*CONFIG.BUCKET_RATE);
-  b.t = t;
-  if (b.tokens >= 1){ b.tokens -= 1; buckets.set(k,b); return true; }
-  buckets.set(k,b); return false;
-}
-
-/***** 최종값 + 스냅샷 *****/
-const INPUTS = "input, textarea";
-const FINAL_TIMERS = new WeakMap();
-
-function scheduleFinalRecord(t){
-  clearTimeout(FINAL_TIMERS.get(t));
-  FINAL_TIMERS.set(t, setTimeout(()=>{
-    withDomSnapshot(t, snap => record(t,"change", t.value, { snapshot: snap }));
-  }, CONFIG.FINAL_DEBOUNCE_MS));
-}
-
-if (CONFIG.CAPTURE_MODE!=='PER_EVENT'){
-  addEventListener("input",(e)=>{ const t=e.target?.closest(INPUTS); if(t) scheduleFinalRecord(t); }, true);
-  addEventListener("blur",(e)=>{ const t=e.target?.closest(INPUTS); if(!t) return; clearTimeout(FINAL_TIMERS.get(t)); withDomSnapshot(t, snap => record(t,"change", t.value, { snapshot: snap })); }, true);
-  addEventListener("keydown",(e)=>{ if(e.key!=="Enter") return; const t=e.target?.closest(INPUTS); if(!t) return; clearTimeout(FINAL_TIMERS.get(t)); withDomSnapshot(t, snap => record(t,"change", t.value, { snapshot: snap })); }, true);
-  addEventListener("change",(e)=>{ const t=e.target?.closest("select"); if(!t) return; const opt=t.selectedOptions?.[0]; withDomSnapshot(t, snap => record(t,"change", t.value, { selectedText: opt?.text||null, snapshot: snap })); }, true);
-}
-
-/***** 전량 이벤트(경량) *****/
-if (CONFIG.CAPTURE_MODE!=='FINAL_ONLY'){
+  let INSTALL_ID = null;
+  let BROWSER_ID = null;
+  let TAB_ID = null;
+  let LOGIN_ID = 'unknown';        // storage.local 에서 로드/캡처
+  const FINAL_TIMERS = new WeakMap();
   let lastKeyTs = 0;
-  ['keydown','keyup','input'].forEach(evt=>{
-    addEventListener(evt, (e)=>{
-      const t = e.target instanceof Element ? e.target : null;
-      if (!t || !allowEvent(t, evt)) return;
-      const ts = now();
-      if (evt!=='keydown' && (ts - lastKeyTs) < CONFIG.KEY_SAMPLING_MS) return;
-      lastKeyTs = ts;
 
-      const instant = { type: evt };
-      if (!isSensitive(t)){
-        if (evt==='keydown' || evt==='keyup'){
-          instant.key = e.key; instant.ctrl=e.ctrlKey; instant.alt=e.altKey; instant.shift=e.shiftKey;
-        }
-        if (evt==='input'){ instant.length = (t.value||'').length; }
-      } else {
-        instant.sensitive = true;
+  // ───────────────── Utils ─────────────────
+  const pad = (n, w=2) => String(n).padStart(w, "0");
+  function dtUtc(ms) {
+    const d = new Date(ms || Date.now());
+    return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ` +
+           `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}`;
+  }
+  function textOf(n){ return (n?.textContent || "").replace(/\s+/g," ").trim() || null; }
+
+  function cssPath(el){
+    if (!(el instanceof Element)) return null;
+    if (el.id) return `#${CSS.escape(el.id)}`;
+    const parts=[];
+    let cur=el, depth=0;
+    while (cur && cur.nodeType===1 && depth<8){
+      let part = cur.nodeName.toLowerCase();
+      if (cur.classList.length) part += "."+[...cur.classList].map(CSS.escape).join(".");
+      const sib=[...(cur.parentNode?.children||[])].filter(x=>x.nodeName===cur.nodeName);
+      if (sib.length>1) part += `:nth-of-type(${sib.indexOf(cur)+1})`;
+      parts.unshift(part); cur=cur.parentElement; depth++;
+    }
+    return parts.join(" > ");
+  }
+  function xPath(el){
+    if (!(el instanceof Element)) return null;
+    if (el.id) return `//*[@id="${el.id}"]`;
+    const segs=[]; let cur=el;
+    while (cur && cur.nodeType===1){
+      let i=1; for(let s=cur.previousSibling; s; s=s.previousSibling)
+        if (s.nodeType===1 && s.nodeName===cur.nodeName) i++;
+      segs.unshift(`${cur.nodeName.toLowerCase()}[${i}]`);
+      cur=cur.parentNode;
+    }
+    return "/"+segs.join("/");
+  }
+  function datasetAttrs(el, prefix='data-'){
+    const out={}; if(!el?.attributes) return out;
+    for (const a of el.attributes) if (a.name.startsWith(prefix)) out[a.name]=String(a.value).slice(0,500);
+    return out;
+  }
+  function formContext(el){
+    const f = el?.closest?.('form');
+    return f ? { selector: cssPath(f), id: f.id||null, name: f.getAttribute('name')||null, action: f.getAttribute('action')||null } : null;
+  }
+  function bounding(el){
+    try{
+      const r=el.getBoundingClientRect();
+      return { x:Math.round(r.x), y:Math.round(r.y), w:Math.round(r.width), h:Math.round(r.height) };
+    }catch{ return null; }
+  }
+  function getShadowPath(el){
+    const chain=[]; let node=el;
+    try{
+      while (node){
+        const root = node.getRootNode?.();
+        if (root && root.host){ chain.unshift(cssPath(root.host)); node=root.host; }
+        else node=node.parentElement;
       }
-      record(t, 'event', undefined, { instant });
-    }, true);
-  });
-
-  ['focus','blur'].forEach(evt=>{
-    addEventListener(evt, (e)=>{
-      const t = e.target instanceof Element ? e.target : null;
-      if (!t || !allowEvent(t, evt)) return;
-      record(t, 'event', undefined, { instant: { type: evt } });
-    }, true);
-  });
-
-  // form submit 자체도 스냅샷(전/후)
-  addEventListener('submit',(e)=>{
-    const f = e.target instanceof HTMLFormElement ? e.target : null;
-    if (!f) return;
-    withDomSnapshot(f, snap => record(f, 'submit', null, { snapshot: snap }));
-  }, true);
-
-  ['mousedown','mouseup','dblclick','contextmenu'].forEach(evt=>{
-    addEventListener(evt,(e)=>{
-      const t = e.target instanceof Element ? e.target : null;
-      if (!t || !allowEvent(t, evt)) return;
-      const p={ type:evt, button:e.button, x:e.clientX, y:e.clientY };
-      record(t, 'event', undefined, { instant: p });
-    }, true);
-  });
-}
-
-/***** 메뉴 클릭(스냅샷 포함) *****/
-const NAV_ROOT_SELECTOR = 'nav,[role="navigation"],aside,.sidebar,.menu,.navigation';
-const MENU_ITEM_SELECTOR = 'a[href], [role="menuitem"], [role="treeitem"], button, [role="button"], .el-menu-item, .ant-menu-item, [data-az-menu]';
-const MENU_DEDUP = new WeakMap();
-function shouldRecordMenu(el){ const n=now(), p=MENU_DEDUP.get(el)||0; MENU_DEDUP.set(el,n); return (n-p)>400; }
-function navRootOf(el){ return el?.closest(NAV_ROOT_SELECTOR) || null; }
-function liTrail(el, root){
-  const trail=[]; let cur=el.closest('li,[role="menuitem"],[role="treeitem"],a,button');
-  while (cur && (!root || root.contains(cur))){
-    const t=textOf(cur); if (t && !trail.includes(t)) trail.unshift(t);
-    cur = cur.parentElement?.closest?.('li,[role="menuitem"],[role="treeitem"]') || null;
+    }catch{}
+    return chain;
   }
-  return trail.slice(-5);
-}
-addEventListener("click",(e)=>{
-  const el = e.target?.closest(MENU_ITEM_SELECTOR);
-  if (!el || !shouldRecordMenu(el)) return;
-  const root = navRootOf(el);
-  const labelFallback = el.getAttribute('title')
-    || el.getAttribute('aria-label')
-    || Object.values(datasetAttrs(el)).find(Boolean)
-    || textOf(el);
-
-  const payloadBase = {
-    identifier: (el.id?`#${el.id}`:null)
-             || (el.getAttribute('name')?`name=${el.getAttribute('name')}`:null)
-             || (el.getAttribute('data-testid')?`data-testid=${el.getAttribute('data-testid')}`:null)
-             || (el.getAttribute('aria-label')?`aria-label=${el.getAttribute('aria-label')}`:null)
-             || (el.getAttribute('href')?`href=${el.getAttribute('href')}`:null),
-    label: labelFallback || null,
-    href: el.getAttribute('href')||null,
-    role: el.getAttribute('role')||null,
-    a11y: {
-      role: el.getAttribute('role') || null,
-      ariaLabel: el.getAttribute('aria-label') || null,
-      ariaLabelledby: el.getAttribute('aria-labelledby') || null
-    },
-    attributes: {
-      type: el.getAttribute('type') || undefined,
-      name: el.getAttribute('name') || undefined,
-      id: el.id || undefined,
-      class: el.className || undefined
-    },
-    testids: datasetAttrs(el),
-    navRoot: root ? cssPath(root) : null,
-    liTrail: liTrail(el, root),
-    className: el.className||null,
-    bounds: bounding(el),
-    framePath: getFramePath(window),
-    shadowPath: getShadowPath(el),
-    form: formContext(el),
-    meta: getSafeSessionMeta(),
-    title: document.title,
-    referrer: document.referrer||null
-  };
-
-  const domBefore = takeDomSnapshot(el);
-  setTimeout(()=>{
-    const payload = { ...payloadBase, snapshot: { dom_before: domBefore, dom_after: takeDomSnapshot(el) } };
-    chrome.runtime.sendMessage({ type:"BATCH_EVENTS", payload:{ reason:"menu-click", events:[{
-      url: location.href, timestamp: now(), action:"menu_click",
-      selector:{ css: cssPath(el), xpath: xPath(el) },
-      tagName: el.tagName, data: payload
-    }] }});
-  }, SNAPSHOT.AFTER_DELAY_MS);
-}, true);
-
-/***** 라우팅/페이지뷰(기존) *****/
-(function hookHistory(){
-  function emit(from,to){
-    chrome.runtime.sendMessage({ type:"BATCH_EVENTS", payload:{ reason:"route-change", events:[{
-      url: to, timestamp: now(), action:"route_change",
-      selector:{ css:null, xpath:null }, tagName:"ROUTE",
-      data:{ from, to, title: document.title, framePath: getFramePath(window), meta: getSafeSessionMeta() }
-    }] }});
+  function getFramePath(win){
+    try{
+      const chain=[]; let w=win;
+      while (w && w.frameElement){ chain.unshift(cssPath(w.frameElement)); w=w.parent; }
+      return chain;
+    }catch{ return []; }
   }
-  const wrap = name=>{
-    const orig=history[name];
-    history[name]=function(...args){ const from=location.href; const ret=orig.apply(this,args); setTimeout(()=>{ const to=location.href; if (to!==from) emit(from,to); },0); return ret; };
-  };
-  wrap("pushState"); wrap("replaceState");
-  addEventListener("popstate", ()=> emit("(popstate)", location.href));
-})();
-(function pageView(){
-  const send = ()=> chrome.runtime.sendMessage({ type:"BATCH_EVENTS", payload:{ reason:"page-view", events:[{
-    url: location.href, timestamp: now(), action:"page_view",
-    selector:{ css:null, xpath:null }, tagName:"PAGE",
-    data:{ title: document.title, referrer: document.referrer||null, viewport:{w: innerWidth, h: innerHeight}, framePath: getFramePath(window),
-           meta: getSafeSessionMeta() }
-  }] }});
-  if (document.readyState==="complete" || document.readyState==="interactive") send();
-  else addEventListener("DOMContentLoaded", send, { once:true });
-})();
+  function isSensitive(el){
+    const type=(el?.getAttribute?.('type')||"").toLowerCase();
+    const name=(el?.getAttribute?.('name')||"").toLowerCase();
+    return type==="password" || /pass|pwd|ssn|credit|주민|비번/i.test(name);
+  }
+  function maskValue(el, v){
+    if (isSensitive(el)) return "*****";
+    return v;
+  }
+  function normalizeInputValue(el) {
+    if (!el) return null;
+    const tag = (el.tagName || '').toLowerCase();
+    const type = (el.getAttribute && el.getAttribute('type')) || '';
+    if (tag === 'input' && /password/i.test(type)) return null; // never capture passwords
+    if (tag === 'input' || tag === 'textarea') return el.value ?? null;
+    if (el.isContentEditable) return el.innerText || el.textContent || null;
+    return null;
+  }
+  function isMenuElement(el) {
+    if (!el) return false;
+    if (el.tagName === 'A') return true;
+    const role = el.getAttribute?.('role');
+    if (role && /menuitem|tab|button/i.test(role)) return true;
+    return (el.closest && !!el.closest('nav, .nav, .navbar, [role="menubar"], [role="navigation"]'));
+  }
+  function navRootOf(el){ return el?.closest('nav,[role="navigation"],aside,.sidebar,.menu,.navigation') || null; }
+  function liTrail(el, root){
+    const trail=[]; let cur=el?.closest('li,[role="menuitem"],[role="treeitem"],a,button') || el;
+    while (cur && (!root || root.contains(cur))){
+      const t=textOf(cur); if (t && !trail.includes(t)) trail.unshift(t);
+      cur = cur.parentElement?.closest?.('li,[role="menuitem"],[role="treeitem"]') || null;
+    }
+    return trail.slice(-5);
+  }
 
-/***** 로그인 ID 추정/저장 *****/
-function guessLoginId(){
-  try{
-    const candidates = [...document.querySelectorAll('input,textarea')];
-    const score = f =>{
-      const n=(f.getAttribute('name')||'').toLowerCase();
-      const i=(f.id||'').toLowerCase();
-      const p=(f.getAttribute('placeholder')||'').toLowerCase();
-      const t=(f.type||'').toLowerCase();
-      let s=0;
-      if (/(login|userid|user|email|account|아이디|사번)/.test(n+i+p)) s+=2;
-      if (t==='text' || t==='email') s+=1;
-      if ((f.value||'').length>=3) s+=2;
-      return s;
+  // ───────────────── DOM Snapshot ─────────────────
+  function bestSnapshotRoot(el){
+    try{
+      return el?.closest?.('form,[role="dialog"],[data-reactroot],#app,main,body') || document.body || document.documentElement;
+    }catch{ return document.documentElement; }
+  }
+  function takeDomSnapshot(el){
+    if (!SNAPSHOT.ENABLED) return null;
+    let root = bestSnapshotRoot(el);
+    let html = (root?.outerHTML) || document.documentElement.outerHTML || "";
+    if (SNAPSHOT.MAX_CHARS && html.length > SNAPSHOT.MAX_CHARS){
+      html = html.slice(0, SNAPSHOT.MAX_CHARS) + '\n<!-- clipped -->';
+    }
+    return html;
+  }
+  function withDomSnapshot(el, done){
+    const before = takeDomSnapshot(el);
+    setTimeout(()=>{ const after = takeDomSnapshot(el); try{ done({ dom_before: before, dom_after: after }); }catch{}; }, SNAPSHOT.AFTER_DELAY_MS);
+  }
+
+  // ───────────────── Install/Handshake/Login ─────────────────
+  async function ensureInstallId(){
+    try {
+      const got = await chrome.storage.local.get([INSTALL_KEY]);
+      if (got && got[INSTALL_KEY]) INSTALL_ID = got[INSTALL_KEY];
+      else {
+        INSTALL_ID = crypto?.randomUUID?.() || (Date.now() + '-' + Math.random().toString(16).slice(2));
+        await chrome.storage.local.set({ [INSTALL_KEY]: INSTALL_ID });
+      }
+    } catch {
+      INSTALL_ID = crypto?.randomUUID?.() || (Date.now() + '-' + Math.random().toString(16).slice(2));
+    }
+    window.__AZ_INSTALL_ID = INSTALL_ID;
+  }
+  async function loadLoginId(){
+    try{
+      const { loginId } = await chrome.storage.local.get("loginId");
+      const s = (typeof loginId==="string" && loginId.trim()) ? loginId.trim() : null;
+      if (s) LOGIN_ID = s.slice(0,128);
+    }catch{}
+  }
+  function guessLoginId(){
+    try{
+      const candidates = [...document.querySelectorAll('input,textarea')];
+      const score = f =>{
+        const n=(f.getAttribute('name')||'').toLowerCase();
+        const i=(f.id||'').toLowerCase();
+        const p=(f.getAttribute('placeholder')||'').toLowerCase();
+        const t=(f.type||'').toLowerCase();
+        let s=0;
+        if (/(login|userid|user|email|account|아이디|사번)/.test(n+i+p)) s+=2;
+        if (t==='text' || t==='email') s+=1;
+        if ((f.value||'').length>=3) s+=2;
+        return s;
+      };
+      const field = candidates.sort((a,b)=>score(b)-score(a))[0];
+      const val = (field?.value||'').trim();
+      if (val) {
+        const v = val.slice(0,128);
+        chrome.storage.local.set({ loginId: v });
+        LOGIN_ID = v;
+      }
+    }catch{}
+  }
+  function captureLoginIdOnSubmit(){
+    addEventListener('submit', (e)=>{
+      const f = e.target instanceof HTMLFormElement ? e.target : null;
+      if (!f) return;
+      const idField = f.querySelector('input[type="text"],input[type="email"],input[name*="id"],input[name*="user"],input[name*="login"]');
+      const val = (idField?.value||'').trim();
+      if (val) {
+        const v = val.slice(0,128);
+        chrome.storage.local.set({ loginId: v });
+        LOGIN_ID = v;
+      }
+    }, true);
+  }
+  async function handshake() {
+    try {
+      const ack = await chrome.runtime.sendMessage({ type: 'HELLO' });
+      if (ack) {
+        BROWSER_ID = ack?.payload?.browser_session_id || ack?.browser_session_id || null;
+        TAB_ID     = ack?.payload?.tab_id            || ack?.tab_id            || null;
+      }
+    } catch {}
+  }
+
+  // ───────────────── Row Builder ─────────────────
+  function elementUid(el) {
+    if (!el) return null;
+    if (el.id) return `id=${el.id}`;
+    const href = el.getAttribute?.('href'); if (href) return `href=${href}`;
+    const name = el.getAttribute?.('name'); if (name) return `name=${name}`;
+    const cls = (el.className || '').toString().trim().split(/\s+/).filter(Boolean).slice(0,3).join('.');
+    return (el.tagName || 'el').toLowerCase() + (cls ? '.'+cls : '');
+  }
+  function buildRow(el, logicalType, action, inputValue, extra={}) {
+    const menuRoot = logicalType === 'menu' ? navRootOf(el) : null;
+    const menuTrail = logicalType === 'menu' ? liTrail(el, menuRoot) : null;
+    const framePath = JSON.stringify(getFramePath(window));
+    const shadowPath = JSON.stringify(getShadowPath(el));
+    const url = location.href;
+
+    const row = {
+      AZ_event_time: dtUtc(Date.now()),
+
+      // element
+      AZ_element_type: logicalType || 'event',
+      AZ_event_action: action || null,
+      AZ_event_subtype: extra.event_subtype || null,
+      AZ_element_uid: elementUid(el),
+      AZ_element_label: textOf(el) || el?.getAttribute?.('aria-label') || null,
+      AZ_element_tag: (el?.tagName || '').toLowerCase() || null,
+
+      // page
+      AZ_url: url,
+      AZ_url_host: (()=>{ try { return new URL(url).host; } catch { return null; } })(),
+      AZ_url_path: (()=>{ try { return new URL(url).pathname; } catch { return null; } })(),
+      AZ_page_title: document.title || null,
+      AZ_referrer: document.referrer || null,
+
+      // selectors
+      AZ_selector_css: cssPath(el),
+      AZ_selector_xpath: xPath(el),
+      AZ_data_testid: el?.getAttribute?.('data-testid') || el?.getAttribute?.('data-test-id') || null,
+
+      // input
+      AZ_data: (inputValue !== undefined && inputValue !== null) ? maskValue(el, inputValue) : null,
+
+      // session
+      AZ_session_install_id: INSTALL_ID,
+      AZ_session_browser_id: BROWSER_ID,
+      AZ_session_tab_id: TAB_ID,
+      AZ_session_page_id: PAGE_SESSION_ID,
+
+      // login
+      AZ_login_id: LOGIN_ID || 'unknown',
+
+      // viewport
+      AZ_viewport_w: window.innerWidth || null,
+      AZ_viewport_h: window.innerHeight || null,
+
+      // extra context
+      AZ_nav_root: menuRoot ? cssPath(menuRoot) : null,
+      AZ_menu_li_trail: menuTrail ? JSON.stringify(menuTrail) : null,
+      AZ_form_selector: formContext(el)?.selector || null,
+      AZ_form_name: formContext(el)?.name || null,
+      AZ_form_action: formContext(el)?.action || null,
+      AZ_frame_path: framePath,
+      AZ_shadow_path: shadowPath,
+
+      // locators_json (object; server handles JSON or string)
+      AZ_locators_json: {
+        a11y: {
+          role: el?.getAttribute?.('role') || null,
+          ariaLabel: el?.getAttribute?.('aria-label') || null,
+          ariaLabelledby: el?.getAttribute?.('aria-labelledby') || null
+        },
+        testids: datasetAttrs(el),
+        attrs: {
+          id: el?.id || null,
+          name: el?.getAttribute?.('name') || null,
+          class: (el?.className || '').toString() || null
+        },
+        bounds: bounding(el),
+        session: {
+          install_id: INSTALL_ID,
+          browser_session_id: BROWSER_ID,
+          tab_id: TAB_ID,
+          page_session_id: PAGE_SESSION_ID
+        },
+        env: {
+          os: navigator.platform || null,
+          br: 'Chromium',
+          brver: (navigator.userAgent || '').match(/Chrome\/(\S+)/)?.[1] || null,
+          lang: navigator.language || null,
+          tzoffset: new Date().getTimezoneOffset(),
+          ua: navigator.userAgent,
+          sw: screen.width, sh: screen.height, vw: window.innerWidth, vh: window.innerHeight,
+          dpr: window.devicePixelRatio
+        }
+      }
     };
-    const field = candidates.sort((a,b)=>score(b)-score(a))[0];
-    const val = (field?.value||'').trim();
-    if (val) chrome.storage.local.set({ loginId: val.slice(0,128) });
-  }catch{}
-}
-function captureLoginIdOnSubmit(){
-  addEventListener('submit', (e)=>{
+
+    // snapshot (server.js가 AZ_dom_*/AZ_snapshot_*/*snapshot.api_response_body 수용)
+    if (extra.snapshot) {
+      row.snapshot = {
+        dom_before: extra.snapshot.dom_before || null,
+        dom_after: extra.snapshot.dom_after || null
+      };
+    }
+
+    return row;
+  }
+
+  async function sendRows(rows){
+    if (!rows?.length) return;
+    try { await chrome.runtime.sendMessage({ type: 'BATCH_EVENTS', rows }); }
+    catch (e) { console.warn('[BATCH_EVENTS] send failed', e); }
+  }
+
+  // ───────────────── Handlers ─────────────────
+  function onClick(e) {
+    const el = e.target instanceof Element ? e.target : null;
+    if (!el) return;
+    const isMenu = isMenuElement(el);
+
+    if (isMenu) {
+      withDomSnapshot(el, snap => {
+        const row = buildRow(el, 'menu', 'menu_click', textOf(el), { snapshot: snap });
+        sendRows([row]);
+      });
+    } else {
+      const row = buildRow(el, 'event', 'click', null);
+      sendRows([row]);
+    }
+  }
+
+  function onFocus(e) {
+    const el = e.target instanceof Element ? e.target : null;
+    if (!el) return;
+    sendRows([buildRow(el, 'event', 'focus', null)]);
+  }
+  function onBlur(e) {
+    const el = e.target instanceof Element ? e.target : null;
+    if (!el) return;
+    const v = normalizeInputValue(el);
+    withDomSnapshot(el, snap => {
+      const row = buildRow(el, 'event', 'blur', v, { snapshot: snap });
+      sendRows([row]);
+    });
+  }
+
+  function onInput(e) {
+    const el = e.target instanceof Element ? e.target : null;
+    if (!el) return;
+    const now = Date.now();
+    if ((now - lastKeyTs) < CONFIG.KEY_SAMPLING_MS) return;
+    lastKeyTs = now;
+
+    const v = normalizeInputValue(el);
+    if (CONFIG.CAPTURE_MODE !== 'FINAL_ONLY') {
+      sendRows([buildRow(el, 'input', 'change', v)]);
+    }
+    clearTimeout(FINAL_TIMERS.get(el));
+    FINAL_TIMERS.set(el, setTimeout(() => {
+      const val = normalizeInputValue(el);
+      withDomSnapshot(el, snap => {
+        const r = buildRow(el, 'input', 'change', val, { snapshot: snap });
+        sendRows([r]);
+      });
+    }, CONFIG.FINAL_DEBOUNCE_MS));
+  }
+
+  function onKeydown(e) {
+    const el = e.target instanceof Element ? e.target : null;
+    if (!el) return;
+    if (CONFIG.CAPTURE_MODE !== 'FINAL_ONLY') {
+      const r = buildRow(el, 'event', 'keydown', e.key);
+      r.AZ_key = e.key;
+      r.AZ_key_mods = [
+        e.ctrlKey ? 'Ctrl' : null,
+        e.metaKey ? 'Meta' : null,
+        e.altKey ? 'Alt' : null,
+        e.shiftKey ? 'Shift' : null
+      ].filter(Boolean).join('+') || null;
+      sendRows([r]);
+    }
+    if (e.key === 'Enter') {
+      clearTimeout(FINAL_TIMERS.get(el));
+      const val = normalizeInputValue(el);
+      withDomSnapshot(el, snap => {
+        const r = buildRow(el, 'input', 'change', val, { snapshot: snap });
+        sendRows([r]);
+      });
+    }
+  }
+
+  function onSubmit(e) {
     const f = e.target instanceof HTMLFormElement ? e.target : null;
     if (!f) return;
-    const idField = f.querySelector('input[type="text"],input[type="email"],input[name*="id"],input[name*="user"],input[name*="login"]');
-    const val = (idField?.value||'').trim();
-    if (val) chrome.storage.local.set({ loginId: val.slice(0,128) });
-  }, true);
-}
+    withDomSnapshot(f, snap => {
+      const row = buildRow(f, 'event', 'submit', null, { snapshot: snap });
+      sendRows([row]);
+    });
+  }
 
-/***** 초기화 및 백그라운드 핸드셰이크 *****/
-(async function init(){
-  await ensureInstallId();
-  PageSession.env = collectEnv();
-  chrome.runtime.sendMessage({ type:"HELLO" }, (res)=>{
-    if (res){ PageSession.browserSessionId=res.browser_session_id || null; PageSession.tabId=res.tab_id ?? null; }
+  // Page view
+  function sendPageView() {
+    const row = buildRow(document.documentElement, 'page', 'page_view', null);
+    row.AZ_element_uid = 'PAGE';
+    row.AZ_selector_css = 'PAGE';
+    row.AZ_selector_xpath = '/html[1]';
+    row.AZ_element_tag = 'html';
+    sendRows([row]);
+  }
+
+  // SPA route change
+  function setupSpaHooks() {
+    try {
+      const emitRoute = (from, to) => {
+        const r = buildRow(document.documentElement, 'page', 'route_change', null);
+        r.AZ_route_from = from;
+        r.AZ_route_to = to;
+        sendRows([r]);
+      };
+      const wrap = (name) => {
+        const orig = history[name].bind(history);
+        history[name] = function(...args){
+          const from = location.href;
+          const ret = orig(...args);
+          const to = location.href;
+          if (to !== from) emitRoute(from, to);
+          return ret;
+        };
+      };
+      wrap('pushState'); wrap('replaceState');
+      window.addEventListener('popstate', () => emitRoute('(popstate)', location.href), true);
+    } catch {}
+  }
+
+  // FLUSH_REQUEST 호환(현 구조에선 즉시 전송이라 실질 no-op)
+  chrome.runtime.onMessage.addListener((msg)=>{
+    if (msg?.type === 'FLUSH_REQUEST') {
+      // no-op: rows는 즉시 전송
+    }
   });
-  guessLoginId();
-  captureLoginIdOnSubmit();
+
+  // ─────────────── Init ───────────────
+  (async function init(){
+    await ensureInstallId();
+    await loadLoginId();
+    await handshake();
+    guessLoginId();
+    captureLoginIdOnSubmit();
+
+    addEventListener('click', onClick, true);
+    addEventListener('focus', onFocus, true);
+    addEventListener('blur', onBlur, true);
+    addEventListener('input', onInput, true);
+    addEventListener('change', onInput, true);
+    addEventListener('keydown', onKeydown, true);
+    addEventListener('submit', onSubmit, true);
+
+    setupSpaHooks();
+
+    if (document.readyState === 'complete' || document.readyState === 'interactive') sendPageView();
+    else addEventListener('DOMContentLoaded', sendPageView, { once: true });
+  })();
 })();
