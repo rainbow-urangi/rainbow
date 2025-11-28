@@ -1,12 +1,14 @@
 // content.js — Rows emitter with snapshots, final-value debounce, menu trail, SPA routing
-// - Sends fully-formed AZ_* rows directly via { type:'BATCH_EVENTS', rows }
-// - Captures loginId and includes AZ_login_id in each row
-// - Includes a11y/testids/attrs/bounds/session/env in AZ_locators_json (object; server handles both obj/string)
 
 (() => {
   // ───────────────── Config ─────────────────
+  const ALLOWED_HOSTS = ["c4web.c4mix.com"];
+  if (!ALLOWED_HOSTS.includes(location.hostname)) {
+    return; // 다른 사이트에서는 아무 것도 하지 않고 종료
+  }
+  
   const CONFIG = {
-    CAPTURE_MODE: 'BOTH',       // 'FINAL_ONLY' | 'PER_EVENT' | 'BOTH'
+    CAPTURE_MODE: 'FINAL_ONLY',       // 'FINAL_ONLY' | 'PER_EVENT' | 'BOTH'
     KEY_SAMPLING_MS: 120,
     FINAL_DEBOUNCE_MS: 600
   };
@@ -156,6 +158,99 @@
     const before = takeDomSnapshot(el);
     setTimeout(()=>{ const after = takeDomSnapshot(el); try{ done({ dom_before: before, dom_after: after }); }catch{}; }, SNAPSHOT.AFTER_DELAY_MS);
   }
+
+  // ===== API 응답 body 캡처 (page world fetch hook) =====
+  function injectFetchHook() {
+    try {
+      const script = document.createElement("script");
+      script.textContent = "(" + function () {
+        if (!window.fetch) return;
+        const ORIG_FETCH = window.fetch;
+        const MAX_API_BODY = 100000;
+
+        window.fetch = async function (...args) {
+          const res = await ORIG_FETCH.apply(this, args);
+
+          try {
+            let url = res.url;
+            if (!url && typeof args[0] === "string") url = args[0];
+            if (!url && args[0] instanceof Request) url = args[0].url || null;
+
+            // c4web.c4mix.com 만 수집
+            if (!url || !url.includes("c4web.c4mix.com")) {
+              return res;
+            }
+
+            const cloned = res.clone();
+            const ct = (cloned.headers.get("content-type") || "").toLowerCase();
+
+            // 텍스트/JSON 계열만 저장
+            if (!ct.includes("json") && !ct.startsWith("text/") && !ct.includes("xml")) {
+              return res;
+            }
+
+            let bodyText = await cloned.text();
+            if (bodyText && bodyText.length > MAX_API_BODY) {
+              bodyText = bodyText.slice(0, MAX_API_BODY) + "\n/* clipped */";
+            }
+
+            // 페이지 월드 -> content script로 전달
+            window.postMessage(
+              {
+                source: "az-extension",
+                type: "AZ_FETCH_BODY",
+                url,
+                status: res.status,
+                method:
+                  (args[1] && args[1].method) ||
+                  (args[0] && args[0].method) ||
+                  "GET",
+                body: bodyText,
+              },
+              "*"
+            );
+          } catch (e) {
+            console.warn("[az-fetch-hook] failed", e);
+          }
+
+          return res;
+        };
+      } + ")();";
+
+      (document.documentElement || document.head || document.body).appendChild(script);
+      script.remove();
+    } catch (e) {
+      console.warn("[injectFetchHook] failed", e);
+    }
+  }
+
+  // 페이지 월드에서 postMessage로 보내주는 fetch body 수신
+  window.addEventListener("message", (event) => {
+    if (event.source !== window) return;
+    const data = event.data;
+    if (!data || data.source !== "az-extension" || data.type !== "AZ_FETCH_BODY") return;
+
+    const { url, status, method, body } = data;
+
+    // API 응답 전용 row 생성
+    const row = buildRow(
+      null,          // el 없음
+      "api",         // logicalType
+      "api_response",// action
+      null,
+      {
+        snapshot: { api_response_body: body }
+      }
+    );
+
+    row.AZ_api_url    = url;
+    row.AZ_api_status = status;
+    row.AZ_api_method = method;
+
+    // host/path는 buildRow에서 page_url 기준으로 이미 채우고 있고,
+    // server.js enrichRow()가 AZ_api_url로부터 host/path 파생도 해줍니다.
+    sendRows([row]);
+  });
 
   // ───────────────── Install/Handshake/Login ─────────────────
   async function ensureInstallId(){
@@ -325,7 +420,8 @@
     if (extra.snapshot) {
       row.snapshot = {
         dom_before: extra.snapshot.dom_before || null,
-        dom_after: extra.snapshot.dom_after || null
+        dom_after: extra.snapshot.dom_after || null,
+        api_response_body: extra.snapshot.api_response_body ?? null
       };
     }
 
@@ -472,6 +568,7 @@
     await handshake();
     guessLoginId();
     captureLoginIdOnSubmit();
+    injectFetchHook();
 
     addEventListener('click', onClick, true);
     addEventListener('focus', onFocus, true);
