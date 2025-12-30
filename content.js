@@ -122,6 +122,37 @@
     if (el.isContentEditable) return el.innerText || el.textContent || null;
     return null;
   }
+
+  // 🔥 NEW: input/button/div/grid 대응용 value extractor
+  function extractBestValue(el) {
+  if (!el) return null;
+
+  // 1) input / textarea / contenteditable
+  let v = normalizeInputValue(el);
+  if (v) return v;
+
+  // 2) aria-value 계열 (grid, slider 등)
+  const ariaVal =
+    el.getAttribute?.('aria-valuetext') ||
+    el.getAttribute?.('aria-value');
+  if (ariaVal) return ariaVal;
+
+  // 3) 자기 자신 텍스트
+  const txt = textOf(el);
+  if (txt) return txt;
+
+  // 4) 주변 input/select 탐색 (버튼 → 검색어)
+  const near = el.closest('form,div')?.querySelector(
+    'input:not([type=password]), textarea, select'
+  );
+  if (near) {
+    const nv = normalizeInputValue(near);
+    if (nv) return nv;
+  }
+
+  return null;
+}
+
   function isMenuElement(el) {
     if (!el) return false;
     if (el.tagName === 'A') return true;
@@ -459,7 +490,7 @@
   function onBlur(e) {
     const el = e.target instanceof Element ? e.target : null;
     if (!el) return;
-    const v = normalizeInputValue(el);
+    const v = extractBestValue(el);
     withDomSnapshot(el, snap => {
       const row = buildRow(el, 'event', 'blur', v, { snapshot: snap });
       sendRows([row]);
@@ -473,13 +504,13 @@
     if ((now - lastKeyTs) < CONFIG.KEY_SAMPLING_MS) return;
     lastKeyTs = now;
 
-    const v = normalizeInputValue(el);
+    const v = extractBestValue(el);
     if (CONFIG.CAPTURE_MODE !== 'FINAL_ONLY') {
       sendRows([buildRow(el, 'input', 'change', v)]);
     }
     clearTimeout(FINAL_TIMERS.get(el));
     FINAL_TIMERS.set(el, setTimeout(() => {
-      const val = normalizeInputValue(el);
+      const val = extractBestValue(el);
       withDomSnapshot(el, snap => {
         const r = buildRow(el, 'input', 'change', val, { snapshot: snap });
         sendRows([r]);
@@ -503,7 +534,7 @@
     }
     if (e.key === 'Enter') {
       clearTimeout(FINAL_TIMERS.get(el));
-      const val = normalizeInputValue(el);
+      const val = extractBestValue(el);
       withDomSnapshot(el, snap => {
         const r = buildRow(el, 'input', 'change', val, { snapshot: snap });
         sendRows([r]);
@@ -537,6 +568,7 @@
         const r = buildRow(document.documentElement, 'page', 'route_change', null);
         r.AZ_route_from = from;
         r.AZ_route_to = to;
+        r.AZ_page_title = document.title || null;
         sendRows([r]);
       };
       const wrap = (name) => {
