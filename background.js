@@ -512,61 +512,154 @@ function eventToDbRow(ev, tabId, loginId = "unknown") {
 
 /***** 메시지 수신 — rows(신) & payload.events(구) 모두 지원 *****/
 chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  // ✅ 이 타입이 아니면 포트를 열지 않음
+  if (msg?.type !== "BATCH_EVENTS") return;
+
   (async () => {
-    if (msg?.type !== "BATCH_EVENTS") return;
+    try {
+      const tabId = sender?.tab?.id ?? -1;
+      const reason = msg.payload?.reason || msg.reason || "";
 
-    const tabId = sender?.tab?.id ?? -1;
-    const reason = msg.payload?.reason || msg.reason || "";
+      // 1) 새 포맷: rows (content.js에서 AZ_* 필드 직접 생성)
+      if (Array.isArray(msg.rows)) {
+        const rows = msg.rows.map((r0) => {
+          const r = { ...r0 };
 
-    // 1) 새 포맷: rows (content.js에서 AZ_* 필드 직접 생성)
-    if (Array.isArray(msg.rows)) {
-      const rows = msg.rows.map((r0) => {
-        const r = { ...r0 };
+          // 세션 보강
+          if (r.AZ_session_tab_id == null) r.AZ_session_tab_id = tabId;
+          if (r.AZ_session_browser_id == null) r.AZ_session_browser_id = BROWSER_SESSION_ID;
 
-        // 세션 보강
-        if (r.AZ_session_tab_id == null) r.AZ_session_tab_id = tabId;
-        if (r.AZ_session_browser_id == null) r.AZ_session_browser_id = BROWSER_SESSION_ID;
+          // URL 파생 보강
+          if (!r.AZ_url_host && r.AZ_url) r.AZ_url_host = urlHost(r.AZ_url);
+          if (!r.AZ_url_path && r.AZ_url) r.AZ_url_path = urlPath(r.AZ_url);
 
-        // URL 파생 보강
-        if (!r.AZ_url_host && r.AZ_url) r.AZ_url_host = urlHost(r.AZ_url);
-        if (!r.AZ_url_path && r.AZ_url) r.AZ_url_path = urlPath(r.AZ_url);
+          // API 메타 자동 부착
+          const meta = attachApi(r.AZ_url || "", tabId);
+          for (const k of Object.keys(meta)) {
+            if (r[k] == null) r[k] = meta[k];
+          }
 
-        // API 메타 자동 부착
-        const meta = attachApi(r.AZ_url || "", tabId);
-        for (const k of Object.keys(meta)) {
-          if (r[k] == null) r[k] = meta[k];
-        }
+          return r;
+        });
 
-        return r;
-      });
+        logAndBuffer(reason, rows);
+        sendResponse?.({ ok: true, logged: rows.length, mode: "rows" });
+        return;
+      }
+
+      // 2) 구 포맷: payload.events → 변환
+      const events = Array.isArray(msg.payload?.events) ? msg.payload.events : [];
+      const { loginId } = await chrome.storage.local.get("loginId");
+      const lid = typeof loginId === "string" && loginId.trim() ? loginId.trim() : "unknown";
+
+      const rows = [];
+      for (const ev of events) {
+        const row = eventToDbRow(ev, tabId, lid);
+        if (!row) continue;
+
+        if (row.AZ_session_tab_id == null) row.AZ_session_tab_id = tabId;
+        if (row.AZ_session_browser_id == null) row.AZ_session_browser_id = BROWSER_SESSION_ID;
+        rows.push(row);
+      }
 
       logAndBuffer(reason, rows);
-      sendResponse?.({ ok: true, logged: rows.length, mode: "rows" });
-      return;
+      sendResponse?.({ ok: true, logged: rows.length, mode: "events" });
+    } catch (e) {
+      console.error("[BATCH_EVENTS] handler failed", e);
+      sendResponse?.({ ok: false, error: String(e?.message || e) });
     }
-
-    // 2) 구 포맷: payload.events → 변환
-    const events = Array.isArray(msg.payload?.events) ? msg.payload.events : [];
-    const { loginId } = await chrome.storage.local.get("loginId");
-    const lid =
-      typeof loginId === "string" && loginId.trim()
-        ? loginId.trim()
-        : "unknown";
-
-    const rows = [];
-    for (const ev of events) {
-      const row = eventToDbRow(ev, tabId, lid);
-      if (!row) continue;
-
-      if (row.AZ_session_tab_id == null) row.AZ_session_tab_id = tabId;
-      if (row.AZ_session_browser_id == null) {
-        row.AZ_session_browser_id = BROWSER_SESSION_ID;
-      }
-      rows.push(row);
-    }
-
-    logAndBuffer(reason, rows);
-    sendResponse?.({ ok: true, logged: rows.length, mode: "events" });
   })();
-  return true; // async sendResponse 허용
+
+  return true; // ✅ async sendResponse 허용 (BATCH_EVENTS일 때만)
 });
+
+
+
+// ✅ MAIN world에 fetch hook 설치 (CSP-safe)
+function AZ_installFetchHook_MAIN() {
+  try {
+    // 중복 설치 방지
+    if (window.__AZ_FETCH_HOOK_INSTALLED__) return;
+    window.__AZ_FETCH_HOOK_INSTALLED__ = true;
+
+    if (!window.fetch) return;
+
+    const ORIG_FETCH = window.fetch.bind(window);
+    const MAX_API_BODY = 100000;
+
+    window.fetch = async function (...args) {
+      const res = await ORIG_FETCH(...args);
+
+      try {
+        let url = res.url;
+        if (!url && typeof args[0] === "string") url = args[0];
+        if (!url && args[0] && typeof args[0] === "object" && args[0].url) url = args[0].url;
+
+        if (!url) return res;
+
+        // 필요 시 도메인 필터(원하시면 기존처럼 c4web.c4mix.com만 유지 가능)
+        const u = new URL(url, location.href);
+        if (u.host !== "c4web.c4mix.com") return res;
+
+        const cloned = res.clone();
+        const ct = (cloned.headers.get("content-type") || "").toLowerCase();
+
+        // 텍스트/JSON/XML만 저장
+        if (!ct.includes("json") && !ct.startsWith("text/") && !ct.includes("xml")) return res;
+
+        let bodyText = await cloned.text();
+        if (bodyText && bodyText.length > MAX_API_BODY) {
+          bodyText = bodyText.slice(0, MAX_API_BODY) + "\n/* clipped */";
+        }
+
+        window.postMessage(
+          {
+            source: "az-extension",
+            type: "AZ_FETCH_BODY",
+            url,
+            status: res.status,
+            method:
+              (args[1] && args[1].method) ||
+              (args[0] && args[0].method) ||
+              "GET",
+            body: bodyText,
+          },
+          "*"
+        );
+      } catch (_) {
+        // hook 실패는 조용히 무시
+      }
+
+      return res;
+    };
+  } catch (_) {}
+}
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  if (msg?.type !== "AZ_INJECT_FETCH_HOOK") return;
+
+  (async () => {
+    try {
+      const tabId = sender?.tab?.id;
+      if (tabId == null || tabId < 0) throw new Error("no_tab");
+
+      // ✅ sender.frameId로 “해당 프레임에만” 설치(중복/과다 설치 방지)
+      const frameIds =
+        typeof sender.frameId === "number" ? [sender.frameId] : undefined;
+
+      await chrome.scripting.executeScript({
+        target: frameIds ? { tabId, frameIds } : { tabId },
+        world: "MAIN",
+        func: AZ_installFetchHook_MAIN,
+      });
+
+      sendResponse?.({ ok: true });
+    } catch (e) {
+      console.warn("[AZ] inject fetch hook failed", e);
+      sendResponse?.({ ok: false, error: String(e?.message || e) });
+    }
+  })();
+
+  return true; // async sendResponse
+});
+

@@ -190,70 +190,20 @@
     setTimeout(()=>{ const after = takeDomSnapshot(el); try{ done({ dom_before: before, dom_after: after }); }catch{}; }, SNAPSHOT.AFTER_DELAY_MS);
   }
 
-  // ===== API 응답 body 캡처 (page world fetch hook) =====
-  function injectFetchHook() {
+  // ===== API 응답 body 캡처 (CSP-safe: background에서 MAIN world로 설치) =====
+  let __azFetchHookRequested = false;
+
+  async function injectFetchHook() {
+    if (__azFetchHookRequested) return;
+    __azFetchHookRequested = true;
+
     try {
-      const script = document.createElement("script");
-      script.textContent = "(" + function () {
-        if (!window.fetch) return;
-        const ORIG_FETCH = window.fetch;
-        const MAX_API_BODY = 100000;
-
-        window.fetch = async function (...args) {
-          const res = await ORIG_FETCH.apply(this, args);
-
-          try {
-            let url = res.url;
-            if (!url && typeof args[0] === "string") url = args[0];
-            if (!url && args[0] instanceof Request) url = args[0].url || null;
-
-            // c4web.c4mix.com 만 수집
-            if (!url || !url.includes("c4web.c4mix.com")) {
-              return res;
-            }
-
-            const cloned = res.clone();
-            const ct = (cloned.headers.get("content-type") || "").toLowerCase();
-
-            // 텍스트/JSON 계열만 저장
-            if (!ct.includes("json") && !ct.startsWith("text/") && !ct.includes("xml")) {
-              return res;
-            }
-
-            let bodyText = await cloned.text();
-            if (bodyText && bodyText.length > MAX_API_BODY) {
-              bodyText = bodyText.slice(0, MAX_API_BODY) + "\n/* clipped */";
-            }
-
-            // 페이지 월드 -> content script로 전달
-            window.postMessage(
-              {
-                source: "az-extension",
-                type: "AZ_FETCH_BODY",
-                url,
-                status: res.status,
-                method:
-                  (args[1] && args[1].method) ||
-                  (args[0] && args[0].method) ||
-                  "GET",
-                body: bodyText,
-              },
-              "*"
-            );
-          } catch (e) {
-            console.warn("[az-fetch-hook] failed", e);
-          }
-
-          return res;
-        };
-      } + ")();";
-
-      (document.documentElement || document.head || document.body).appendChild(script);
-      script.remove();
+      await chrome.runtime.sendMessage({ type: "AZ_INJECT_FETCH_HOOK" });
     } catch (e) {
-      console.warn("[injectFetchHook] failed", e);
+      console.warn("[AZ] fetch hook inject request failed", e);
     }
   }
+
 
   // 페이지 월드에서 postMessage로 보내주는 fetch body 수신
   window.addEventListener("message", (event) => {
@@ -585,13 +535,6 @@
       window.addEventListener('popstate', () => emitRoute('(popstate)', location.href), true);
     } catch {}
   }
-
-  // FLUSH_REQUEST 호환(현 구조에선 즉시 전송이라 실질 no-op)
-  chrome.runtime.onMessage.addListener((msg)=>{
-    if (msg?.type === 'FLUSH_REQUEST') {
-      // no-op: rows는 즉시 전송
-    }
-  });
 
   // ─────────────── Init ───────────────
   (async function init(){
