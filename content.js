@@ -45,6 +45,159 @@
   }
   function textOf(n){ return (n?.textContent || "").replace(/\s+/g," ").trim() || null; }
 
+  // ───────────────── Visible Text & Associated Label ─────────────────
+  // 고객 요청:
+  //  (A) 클릭 가능한 요소의 화면 노출 텍스트 → events.element_text
+  //  (B) 입력 필드의 라벨/placeholder → events.associated_label
+  const MAX_ELEMENT_TEXT_CHARS = 2048;
+  const MAX_ASSOC_LABEL_CHARS  = 2048;
+
+  // 클릭 가능한 요소(버튼/링크 등). 클릭 시 e.target이 span/icon일 수 있어 closest로 끌어올려 사용
+  const CLICKABLE_SELECTOR =
+    'button,a,[role="button"],[role="link"],[role="menuitem"],[role="tab"],' +
+    'input[type="button"],input[type="submit"],input[type="reset"],input[type="image"]';
+
+  function clampText(s, maxLen){
+    if (s == null) return null;
+    const t = String(s).replace(/\s+/g, ' ').trim();
+    if (!t) return null;
+    return t.length > maxLen ? t.slice(0, maxLen) : t;
+  }
+
+  function isClickableElement(el){
+    if (!(el instanceof Element)) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag === 'button' || tag === 'a') return true;
+    if (tag === 'input') {
+      const type = (el.getAttribute('type') || '').toLowerCase();
+      if (['button','submit','reset','image'].includes(type)) return true;
+    }
+    const role = el.getAttribute?.('role') || '';
+    if (role && /button|link|menuitem|tab/i.test(role)) return true;
+    if (typeof el.onclick === 'function') return true;
+    return false;
+  }
+
+  // "사용자에게 보이는" 텍스트: innerText 우선 + fallback(textContent/aria-label)
+  function visibleTextOf(el){
+    if (!(el instanceof Element)) return null;
+
+    // input[type=button|submit|reset]은 value가 화면 텍스트
+    if ((el.tagName || '').toLowerCase() === 'input') {
+      const type = (el.getAttribute('type') || '').toLowerCase();
+      if (['button','submit','reset'].includes(type)) {
+        const v = clampText(el.value, MAX_ELEMENT_TEXT_CHARS);
+        if (v) return v;
+      }
+    }
+
+    let t = null;
+    try { t = el.innerText; } catch { /* ignore */ }
+    t = clampText(t, MAX_ELEMENT_TEXT_CHARS);
+    if (t) return t;
+
+    t = clampText(el.textContent, MAX_ELEMENT_TEXT_CHARS);
+    if (t) return t;
+
+    t = clampText(el.getAttribute?.('aria-label') || null, MAX_ELEMENT_TEXT_CHARS);
+    return t;
+  }
+
+  function isInputLike(el){
+    if (!(el instanceof Element)) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;
+    if (el.isContentEditable) return true;
+    return false;
+  }
+
+  function associatedLabelOf(el){
+    if (!isInputLike(el)) return null;
+
+    // 0) placeholder (요청사항: label이 없으면 placeholder)
+    const placeholder = clampText(el.getAttribute?.('placeholder') || null, MAX_ASSOC_LABEL_CHARS);
+
+    // 1) label[for=id]
+    const id = el.id;
+    if (id) {
+      try {
+        const lbl = document.querySelector(`label[for="${CSS.escape(id)}"]`);
+        const t = clampText(visibleTextOf(lbl) || textOf(lbl), MAX_ASSOC_LABEL_CHARS);
+        if (t) return t;
+      } catch { /* ignore */ }
+    }
+
+    // 2) wrapping label
+    const wrap = el.closest?.('label');
+    if (wrap) {
+      const t = clampText(visibleTextOf(wrap) || textOf(wrap), MAX_ASSOC_LABEL_CHARS);
+      if (t) return t;
+    }
+
+    // 3) aria-label
+    const aria = clampText(el.getAttribute?.('aria-label') || null, MAX_ASSOC_LABEL_CHARS);
+    if (aria) return aria;
+
+    // 4) aria-labelledby
+    const labelledby = (el.getAttribute?.('aria-labelledby') || '').trim();
+    if (labelledby) {
+      const ids = labelledby.split(/\s+/).filter(Boolean);
+      const parts = ids
+        .map((i) => document.getElementById(i))
+        .filter(Boolean)
+        .map((n) => clampText(visibleTextOf(n) || textOf(n), MAX_ASSOC_LABEL_CHARS))
+        .filter(Boolean);
+      if (parts.length) return clampText(parts.join(' '), MAX_ASSOC_LABEL_CHARS);
+    }
+
+    // 5) 근접 라벨 후보(부트스트랩 input-group / 커스텀 폼 대응)
+    //    - label 태그뿐 아니라 .input-group-addon/.input-group-text 등도 지원
+    //    - 동일 컨테이너 내 라벨이 여러 개면 "현재 입력 바로 앞" 텍스트 우선
+    try {
+      const container =
+        el.closest('.input-group') ||
+        el.closest('.form-group') ||
+        el.closest('td,th,div,form,fieldset') ||
+        null;
+
+      if (container) {
+        const selector = [
+          'label',
+          '[role="label"]',
+          '.input-group-addon',
+          '.input-group-text',
+          '.input-group-prepend',
+          '.input-group-append',
+          '.label',
+          '[class*="label"]',
+          '[class*="Label"]',
+          '.title',
+          '[class*="title"]',
+          '[class*="Title"]'
+        ].join(',');
+
+        const nodes = [...container.querySelectorAll(selector)].filter(n => n && n !== el);
+
+        // 입력 요소 "앞쪽" 후보 중 가장 가까운 것(마지막)을 선택
+        const prior = nodes.filter(n => (n.compareDocumentPosition(el) & Node.DOCUMENT_POSITION_FOLLOWING));
+        for (let i = prior.length - 1; i >= 0; i--) {
+          const t = clampText(visibleTextOf(prior[i]) || textOf(prior[i]), MAX_ASSOC_LABEL_CHARS);
+          if (t) return t;
+        }
+
+        // 앞쪽 후보가 없으면 전체 후보 중 마지막이라도 사용
+        for (let i = nodes.length - 1; i >= 0; i--) {
+          const t = clampText(visibleTextOf(nodes[i]) || textOf(nodes[i]), MAX_ASSOC_LABEL_CHARS);
+          if (t) return t;
+        }
+      }
+    } catch { /* ignore */ }
+
+    // 6) fallback: placeholder
+    return placeholder || null;
+  }
+
+
   function cssPath(el){
     if (!(el instanceof Element)) return null;
     if (el.id) return `#${CSS.escape(el.id)}`;
@@ -316,6 +469,11 @@
     const shadowPath = JSON.stringify(getShadowPath(el));
     const url = location.href;
 
+    // element_text / associated_label (DB 컬럼: events.element_text / events.associated_label)
+    const clickableBase = (el && el.closest) ? (el.closest(CLICKABLE_SELECTOR) || el) : el;
+    const element_text = (clickableBase && isClickableElement(clickableBase)) ? visibleTextOf(clickableBase) : null;
+    const associated_label = (el && isInputLike(el)) ? associatedLabelOf(el) : null;
+
     const row = {
       AZ_event_time: dtUtc(Date.now()),
 
@@ -325,6 +483,8 @@
       AZ_event_subtype: extra.event_subtype || null,
       AZ_element_uid: elementUid(el),
       AZ_element_label: textOf(el) || el?.getAttribute?.('aria-label') || null,
+      AZ_element_text: element_text,
+      AZ_associated_label: associated_label,
       AZ_element_tag: (el?.tagName || '').toLowerCase() || null,
 
       // page

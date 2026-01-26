@@ -231,7 +231,7 @@ function logAndBuffer(reason, rows) {
   try {
     console.table(rows, [
       "AZ_event_action","AZ_event_subtype","AZ_url","AZ_url_host","AZ_url_path",
-      "AZ_element_type","AZ_element_uid","AZ_element_label",
+      "AZ_element_type","AZ_element_uid","AZ_element_label","AZ_element_text","AZ_associated_label",
       "AZ_api_method","AZ_api_status","AZ_api_path","AZ_api_latency_ms",
       "AZ_login_id","AZ_event_time"
     ]);
@@ -249,7 +249,7 @@ const CSV_HEADERS = [
   // 기존 19개
   "AZ_api_url","AZ_api_method","AZ_api_status","AZ_api_path",
   "AZ_ip_address","AZ_url","AZ_login_id","AZ_event_time",
-  "AZ_element_uid","AZ_element_type","AZ_element_label","AZ_data",
+  "AZ_element_uid","AZ_element_type","AZ_element_label","AZ_element_text","AZ_associated_label","AZ_data",
   "AZ_frame_path","AZ_shadow_path","AZ_form_selector",
   "AZ_locators_json","AZ_nav_root","AZ_menu_li_trail","AZ_post_hints",
   // 확장 메타
