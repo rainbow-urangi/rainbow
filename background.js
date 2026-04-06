@@ -1,8 +1,9 @@
 // background.js — Unified: 기존 CSV/디버그/변환 로직 유지 + rows 직행 업로드 + 재시도 큐 + 영속 브라우저 ID
 
 /***** 업로드/내보내기 설정 *****/
+// ⚠️ LOCAL DEV TEST ENVIRONMENT
 const REALTIME_UPLOAD = true;
-const INGEST_URL = "http://34.22.96.191:8080/ingest/batch";
+const INGEST_URL = "http://125.177.146.253:2241/ingest/batch";
 const INGEST_API_KEY = "9F2A4C7D1E8B0FA3D6C4B1E7A9F03D2";
 
 /***** 업로드 큐/히스토리 *****/
@@ -13,8 +14,78 @@ const UPLOAD_QUEUE = [];
 let uploadTimer = null;
 const UPLOAD_INTERVAL_MS = 3000;
 
+// 탭 종료 상태 기록
+// GIT HISTORY NOTE (2ec7e8b -> 5918e02)
+// background.js는 초기에는 "업로드 큐 + API 메타 부착기"에 가까웠습니다.
+// 이후 커밋들에서 세 가지 축이 커졌습니다.
+// 1) 탭 전환/복귀 추적: tab resume 힌트를 content.js로 보내 page_view를 다시 발생시킴
+// 2) 종료 안정성: 마지막 row를 기억했다가 tab close 시 page_close row를 합성
+// 3) 잡음 제거: identity/value/text가 없는 change 이벤트를 버려 CSV/DB 오염을 줄임
+// 즉 이 파일의 역할이 "전송"에서 "세션/탭 경계 보정"까지 넓어졌습니다.
+const lastRowByTab = new Map();
+
+const pendingNavClickByTab = new Map();
+let lastActiveTabId = null;
+
+function notifyResumeToTab(tabId, reason) {
+  if (typeof tabId !== "number" || tabId < 0) return;
+
+  chrome.tabs.sendMessage(
+    tabId,
+    { type: "AZ_PAGE_RESUME_HINT", reason, ts: Date.now(), tab_changed: true },
+    () => { void chrome.runtime.lastError; }
+  );
+}
+
+function handleActiveTabChanged(tabId, reason) {
+  if (typeof tabId !== "number" || tabId < 0) return;
+  if (lastActiveTabId === tabId) return; // tab_id 안 바뀌면 발행 안 함
+
+  lastActiveTabId = tabId;
+  notifyResumeToTab(tabId, reason);
+}
+
+chrome.tabs.onActivated.addListener(({ tabId }) => {
+  handleActiveTabChanged(tabId, "tabs.onActivated");
+});
+
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
+
+  chrome.tabs.query({ active: true, windowId }, (tabs) => {
+    const tabId = tabs?.[0]?.id;
+    handleActiveTabChanged(tabId, "windows.onFocusChanged");
+  });
+});
+
+// 초기 기준값만 세팅
+chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
+  lastActiveTabId = tabs?.[0]?.id ?? null;
+});
+
+chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
+  const tabId = sender?.tab?.id;
+  if (!tabId) return;
+
+  if (msg?.type === 'NAV_CLICK_STORE') {
+    pendingNavClickByTab.set(tabId, msg.payload);
+    sendResponse({ ok: true });
+    return true;
+  }
+
+  if (msg?.type === 'NAV_CLICK_POP') {
+    const payload = pendingNavClickByTab.get(tabId) || null;
+    pendingNavClickByTab.delete(tabId);
+    sendResponse({ ok: true, payload });
+    return true;
+  }
+});
+
 /***** 유틸 *****/
-const pad = (n, z = 2) => String(n).padStart(z, "0");
+/*
+CHANGE NOTE: code_after 의 dt0()는 UTC 초 단위 문자열만 만들었습니다.
+
+LEGACY_FROM_code_after:
 function dt0(ms) {
   const d = new Date(ms || Date.now());
   return (
@@ -24,6 +95,23 @@ function dt0(ms) {
     pad(d.getUTCHours()) + ":" +
     pad(d.getUTCMinutes()) + ":" +
     pad(d.getUTCSeconds())
+  );
+}
+
+현재는 KST(+09:00) 기준 + ms까지 포함합니다.
+*/
+const pad = (n, z = 2) => String(n).padStart(z, "0");
+function dt0(ms) {
+  const d = new Date(ms || Date.now());
+  const utc9 = new Date(d.getTime() + (9 * 60 * 60 * 1000));
+  return (
+    utc9.getUTCFullYear() + "-" +
+    pad(utc9.getUTCMonth() + 1) + "-" +
+    pad(utc9.getUTCDate()) + " " +
+    pad(utc9.getUTCHours()) + ":" +
+    pad(utc9.getUTCMinutes()) + ":" +
+    pad(utc9.getUTCSeconds()) + "." +
+    pad(utc9.getUTCMilliseconds(), 3)
   );
 }
 function csvEscape(v) {
@@ -84,6 +172,15 @@ const ALLOWED_KEYS = new Set([
   "ArrowLeft","ArrowRight","ArrowUp","ArrowDown",
   "Home","End","PageUp","PageDown"
 ]);
+function isNoiseChangeRow(r) {
+  const action = (r?.AZ_event_action || "").toLowerCase();
+  const hasIdentity = !!(r?.AZ_element_uid || r?.AZ_selector_css || r?.AZ_selector_xpath || r?.AZ_element_tag);
+  const hasValue = !(r?.AZ_data === null || r?.AZ_data === undefined || r?.AZ_data === "");
+  const hasText = !!(r?.AZ_element_text || r?.AZ_associated_label);
+
+  // action이 비었거나 change인데, 식별/값/텍스트가 전부 없으면 노이즈
+  return (!action || action === "change") && !hasIdentity && !hasValue && !hasText;
+}
 
 /***** 브라우저 세션 ID (영속) *****/
 const BROWSER_KEY = "AZ_BROWSER_ID";
@@ -126,7 +223,37 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 });
 
 /***** API 매핑(지연 포함) *****/
-const lastApiByTab = new Map(); // tabId -> { url, method, status, startTs, endTs, latencyMs }
+// const lastApiByTab = new Map(); // tabId -> { url, method, status, startTs, endTs, latencyMs }
+// const bucket = lastApiByTab.get(tabId) || [];
+// bucket.push({ url, method, status, startTs, endTs, latencyMs });
+// lastApiByTab.set(tabId, bucket.slice(-10));
+const lastApiByTab = new Map(); // tabId -> [{ requestId, url, method, status, startTs, endTs, latencyMs }]
+
+function upsertApiMeta(tabId, requestId, patch) {
+  if (tabId < 0 || !requestId) return;
+  const bucket = lastApiByTab.get(tabId) || [];
+  const idx = bucket.findIndex((item) => item.requestId === requestId);
+  const prev = idx >= 0 ? bucket[idx] : {};
+  const next = { ...prev, ...patch, requestId };
+  if (idx >= 0) bucket[idx] = next;
+  else bucket.push(next);
+  lastApiByTab.set(tabId, bucket.slice(-10));
+}
+
+function getApiMeta(tabId, requestId) {
+  const bucket = lastApiByTab.get(tabId) || [];
+  return bucket.find((item) => item.requestId === requestId) || {};
+}
+
+function pickLatestApiMeta(tabId, pageUrl) {
+  const bucket = lastApiByTab.get(tabId) || [];
+  if (!bucket.length) return {};
+  const sameHostItems = bucket.filter((item) => item.url && sameHost(item.url, pageUrl));
+  const candidates = sameHostItems.length ? sameHostItems : bucket;
+  return candidates
+    .slice()
+    .sort((a, b) => (b.endTs ?? b.startTs ?? 0) - (a.endTs ?? a.startTs ?? 0))[0] || {};
+}
 
 chrome.webRequest.onBeforeRequest.addListener(
   (details) => {
@@ -134,7 +261,7 @@ chrome.webRequest.onBeforeRequest.addListener(
       details.tabId >= 0 &&
       ["xmlhttprequest", "fetch", "beacon", "ping", "main_frame"].includes(details.type)
     ) {
-      lastApiByTab.set(details.tabId, {
+      upsertApiMeta(details.tabId, details.requestId, {
         url: details.url,
         method: details.method,
         status: null,
@@ -152,13 +279,29 @@ chrome.webRequest.onBeforeRequest.addListener(
   { urls: ["<all_urls>"] }
 );
 
+/*
+CHANGE NOTE: code_after 는 tabId >= 0 인 요청을 넓게 모두 받았습니다.
+
+LEGACY_FROM_code_after:
+if (details.tabId >= 0) {
+  ...
+}
+
+현재는 xmlhttprequest/fetch/beacon/ping/main_frame 로 제한합니다.
+변경 이유:
+- 정적 리소스까지 API 메타로 붙는 잡음 감소
+- 업무 의미가 있는 네트워크 이벤트만 남기기 위함
+*/
 chrome.webRequest.onCompleted.addListener(
   (details) => {
-    if (details.tabId >= 0) {
-      const prev = lastApiByTab.get(details.tabId) || {};
+    if (
+      details.tabId >= 0 &&
+      ["xmlhttprequest", "fetch", "beacon", "ping", "main_frame"].includes(details.type)
+    ) {
+      const prev = getApiMeta(details.tabId, details.requestId);
       const startTs = prev.startTs ?? details.timeStamp;
       const endTs = details.timeStamp;
-      lastApiByTab.set(details.tabId, {
+      upsertApiMeta(details.tabId, details.requestId, {
         url: details.url,
         method: details.method,
         status: details.statusCode,
@@ -173,11 +316,14 @@ chrome.webRequest.onCompleted.addListener(
 
 chrome.webRequest.onErrorOccurred?.addListener(
   (details) => {
-    if (details.tabId >= 0) {
-      const prev = lastApiByTab.get(details.tabId) || {};
+    if (
+      details.tabId >= 0 &&
+      ["xmlhttprequest", "fetch", "beacon", "ping", "main_frame"].includes(details.type)
+    ) {
+      const prev = getApiMeta(details.tabId, details.requestId);
       const startTs = prev.startTs ?? details.timeStamp;
       const endTs = details.timeStamp;
-      lastApiByTab.set(details.tabId, {
+      upsertApiMeta(details.tabId, details.requestId, {
         url: details.url,
         method: details.method,
         status: -1,
@@ -195,6 +341,12 @@ function scheduleUpload() {
   if (uploadTimer) return;
   uploadTimer = setTimeout(flushUpload, UPLOAD_INTERVAL_MS);
 }
+
+/*
+CHANGE NOTE: code_after 의 flushUpload 는 단순 업로드 함수였습니다.
+현재는 종료 시 keepalive 전송을 의도하는 isFinal 인자를 받습니다.
+
+LEGACY_FROM_code_after:
 async function flushUpload() {
   uploadTimer = null;
   if (!UPLOAD_QUEUE.length) return;
@@ -204,7 +356,61 @@ async function flushUpload() {
     const body = JSON.stringify({ rows, ts: Date.now() });
     const headers = { "Content-Type": "application/json" };
     if (INGEST_API_KEY) headers["x-api-key"] = INGEST_API_KEY;
+
     const res = await fetch(INGEST_URL, { method: "POST", headers, body });
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      console.warn("[INGEST] non-200", res.status, t);
+      throw new Error(String(res.status));
+    }
+  } catch (e) {
+    console.warn("[INGEST] failed, re-queue", e);
+    UPLOAD_QUEUE.unshift(...rows);
+    scheduleUpload();
+  }
+}
+
+현재 추가 의도:
+- 창 종료 전 마지막 배치 손실 감소
+- page_close 합성 row 와 결합해 종료 이벤트 보존
+
+주의:
+- 현재 코드에서는 options.keepalive 를 만들지만 fetch 호출엔 직접 쓰지 않습니다.
+- 즉 "의도는 keepalive"지만 실제 적용 여부는 별도 확인이 필요합니다.
+*/
+/*
+LEGACY_FROM_2ec7e8b: duplicate-upload reproduction helper
+초기에는 업로드 타이밍 문제를 강제로 재현하려고 5초 abort 실험 코드가 있었습니다.
+운영 코드로는 부적절해서 제거됐고, 지금은 종료 시 keepalive 의도가 추가됐습니다.
+
+    // const FETCH_TIMEOUT_MS = 5000; // [재현용] 5초
+    // const ac = new AbortController();
+    // const tid = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
+    // let res;
+    // try {
+    //   res = await fetch(INGEST_URL, { method: "POST", headers, body, signal: ac.signal });
+    // } finally {
+    //   clearTimeout(tid);
+    // }
+
+주의:
+- 이 코드를 다시 활성화하면 정상 실패와 인위적 실패가 섞여 retry 해석이 왜곡됩니다.
+- keepalive 추가 의도는 "창 종료 전 마지막 배치 손실 감소"입니다.
+*/
+async function flushUpload(isFinal = false) {
+  uploadTimer = null;
+  if (!UPLOAD_QUEUE.length) return;
+
+  const rows = UPLOAD_QUEUE.splice(0, UPLOAD_QUEUE.length);
+  try {
+    const body = JSON.stringify({ rows, ts: Date.now() });
+    const headers = { "Content-Type": "application/json" };
+    if (INGEST_API_KEY) headers["x-api-key"] = INGEST_API_KEY;
+
+    // 창 종료 시 OS에 전송을 위임하기 위해 keepalive 옵션 추가
+    const options = { method: "POST", headers, body };
+    if (isFinal) options.keepalive = true;
+    const res = await fetch(INGEST_URL, options);
     if (!res.ok) {
       const t = await res.text().catch(() => "");
       console.warn("[INGEST] non-200", res.status, t);
@@ -297,7 +503,7 @@ chrome.commands.onCommand.addListener((cmd) => {
 
 /***** 공통 변환 (payload.events → AZ_* 행 생성, 구 content.js 호환) *****/
 function attachApi(url, tabId) {
-  const api = lastApiByTab.get(tabId) || {};
+  const api = pickLatestApiMeta(tabId, url);
   const same = api.url && sameHost(api.url, url);
   return {
     AZ_api_url: same ? api.url : null,
@@ -503,7 +709,7 @@ function eventToDbRow(ev, tabId, loginId = "unknown") {
       AZ_key: key,
       AZ_key_mods: mods,
       AZ_input_length: inputLen,
-      AZ_data: payload ? JSON.stringify(payload) : null
+      AZ_data: payload ? JSON.stringify(payload) : null,
     };
   }
 
@@ -539,11 +745,58 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
             if (r[k] == null) r[k] = meta[k];
           }
 
+          // 데이터 중복 저장 방지용 event_id 추가
+          /*
+          LEGACY_FROM_pre_3bdec56:
+          초기 확장 버전은 event_id 앞에 시간 prefix를 붙였습니다.
+
+          const datePrefix = dt0().replace(" ", "-").replace(/:/g, "");
+          r.AZ_event_id =
+            datePrefix + "-" + (crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2)));
+
+          삭제 이유:
+          - UUID 앞에 timestamp를 더 붙이면 downstream VARCHAR(36) 제한을 넘길 수 있었습니다.
+          - 현재는 UUID 단독 사용으로 길이 안정성을 우선합니다.
+          */
+          if (r.AZ_event_id == null) {
+            r.AZ_event_id =
+              (crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2)));
+          }
           return r;
         });
 
+        const isEmptyNullChange = (r) =>
+          r?.AZ_event_action === "change" &&
+          !r?.AZ_data &&
+          !r?.AZ_element_uid &&
+          !r?.AZ_selector_css &&
+          !r?.AZ_selector_xpath &&
+          !r?.AZ_element_tag &&
+          !r?.AZ_element_text &&
+          !r?.AZ_associated_label;
+      
+        const filteredRows = rows.filter((r) => !isNoiseChangeRow(r));
+
+        // 탭 종료 상태 기록
+        if (filteredRows.length > 0 && tabId !== -1) {
+          lastRowByTab.set(tabId, filteredRows[filteredRows.length - 1]);
+        }
+
+        /*
+        CHANGE NOTE: code_after 는 전달받은 rows 를 그대로 적재했습니다.
+
+        LEGACY_FROM_code_after:
         logAndBuffer(reason, rows);
         sendResponse?.({ ok: true, logged: rows.length, mode: "rows" });
+
+        현재는 isNoiseChangeRow() 필터를 통과한 filteredRows 만 적재합니다.
+        변경 이유:
+        - 식별자/값/텍스트가 모두 없는 change 이벤트 제거
+        - DB/CSV 잡음 감소
+        - 마지막 의미 있는 row 를 tab 단위로 저장해 page_close 합성에 재사용
+        */
+        logAndBuffer(reason, filteredRows);
+        sendResponse?.({ ok: true, logged: filteredRows.length, mode: "rows" });
         return;
       }
 
@@ -562,8 +815,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         rows.push(row);
       }
 
-      logAndBuffer(reason, rows);
-      sendResponse?.({ ok: true, logged: rows.length, mode: "events" });
+      const filteredRows = rows.filter((r) => !isNoiseChangeRow(r));
+
+      logAndBuffer(reason, filteredRows);
+      sendResponse?.({ ok: true, logged: filteredRows.length, mode: "events" });
     } catch (e) {
       console.error("[BATCH_EVENTS] handler failed", e);
       sendResponse?.({ ok: false, error: String(e?.message || e) });
@@ -573,7 +828,83 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   return true; // ✅ async sendResponse 허용 (BATCH_EVENTS일 때만)
 });
 
+/*
+CHANGE NOTE: code_after 에는 탭 종료 시점의 합성 page_close row가 없었습니다.
 
+LEGACY_FROM_code_after:
+// 없음: 마지막 의미 있는 row를 기반으로 종료 이벤트를 남기는 로직이 없었음
+
+현재는 마지막 row를 복제해 page_close로 저장합니다.
+의도:
+- 사용자가 탭을 닫았다는 경계를 로그에 남기기 위함
+- pagehide 직전 유실된 종료 이벤트를 background에서 보정하기 위함
+*/
+function synthesizePageCloseFromLastRow(tabId, reason = "TAB_CLOSED") {
+  const lastRow = lastRowByTab.get(tabId);
+  if (!lastRow) return false;
+  if (lastRow.AZ_event_action === "page_close") return false;
+
+  const closeRow = { ...lastRow };
+  const lastLoc = closeRow.AZ_locators_json && typeof closeRow.AZ_locators_json === "object" && !Array.isArray(closeRow.AZ_locators_json) ? closeRow.AZ_locators_json : null;
+  closeRow.AZ_event_time = dt0(Date.now()); 
+  closeRow.AZ_element_type = "page";
+  closeRow.AZ_event_action = "page_close";
+  closeRow.AZ_element_uid = "PAGE";
+  closeRow.AZ_element_tag = "html";
+  closeRow.AZ_element_text = null;
+  closeRow.AZ_event_subtype = null;
+  closeRow.AZ_element_label = null;
+  closeRow.AZ_associated_label = null;
+  closeRow.AZ_data_testid = null;
+  closeRow.AZ_api_path = null;
+  closeRow.AZ_api_method = null;
+  closeRow.AZ_api_status = null;
+  closeRow.AZ_api_latency_ms = null;
+  closeRow.AZ_locators_json = {
+    a11y: { role: null, ariaLabel: null, ariaLabelledby: null },
+    testids: {},
+    attrs: { id: null, name: null, class: null },
+    bounds: { x: 0, y: 0, w: 0, h: 0 },
+    session: lastLoc?.session || null,
+    env: lastLoc?.env || null,
+    analysis: lastLoc?.analysis || null,
+  }
+  closeRow.AZ_data = null;
+  closeRow.AZ_selector_xpath = '/html[1]';
+  closeRow.AZ_selector_css = 'PAGE';
+  closeRow.AZ_associated_label = null;
+  closeRow.AZ_event_id = crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
+  
+  // 64KB 용량 제한으로 인한 keepalive 전송 실패를 막기 위해 스냅샷 강제 제거
+  delete closeRow.snapshot;
+  closeRow.AZ_dom_before = null;
+  closeRow.AZ_dom_after = null;
+
+  logAndBuffer(reason, [closeRow]);
+  lastRowByTab.delete(tabId);
+
+  return true
+};
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status !== "loading") return;
+
+  const nextUrl = changeInfo.url || tab?.pendingUrl || tab?.url || null;
+  if (!nextUrl) return;
+
+  // 같은 탭에서 새 문서 로딩이 시작되면 이전 페이지를 종료로 합성
+  // synthesizePageCloseFromLastRow(tabId, "TAB_NAVIGATED");
+});
+
+chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
+  // synthesizePageCloseFromLastRow(tabId, "TAB_CLOSED");
+  const synthesized = synthesizePageCloseFromLastRow(tabId, "TAB_CLOSED");
+  if (synthesized || UPLOAD_QUEUE.length) {
+    void flushUpload(true).catch((e) => {
+      console.warn("[INGEST] final flush failed", e);
+    });
+  }
+});
 
 // ✅ MAIN world에 fetch hook 설치 (CSP-safe)
 function AZ_installFetchHook_MAIN() {
@@ -597,9 +928,17 @@ function AZ_installFetchHook_MAIN() {
 
         if (!url) return res;
 
-        // 필요 시 도메인 필터(원하시면 기존처럼 c4web.c4mix.com만 유지 가능)
+        // 필요 시 도메인 필터
         const u = new URL(url, location.href);
+        /*
+        LEGACY_FROM_code_after:
         if (u.host !== "c4web.c4mix.com") return res;
+
+        변경 이유:
+        - 특정 호스트 하나에만 묶어 두면 다른 업무 시스템/테스트 도메인에서 API body 수집이 막힌다.
+        - 현재는 도메인 제한을 주석 처리해 다중 도메인 테스트를 허용한다.
+        */
+        // if (u.host !== "c4web.c4mix.com") return res;
 
         const cloned = res.clone();
         const ct = (cloned.headers.get("content-type") || "").toLowerCase();

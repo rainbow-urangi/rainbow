@@ -4,14 +4,15 @@
   "version": "0.14.0",
   "description": "브라우저 이벤트 수집",
   "permissions": [
-    "storage",
-    "webNavigation",
-    "webRequest",
-    "downloads",
-    "tabs",
+    "storage", 
+    "webNavigation", 
+    "webRequest", 
+    "downloads", 
+    "tabs", 
+    "windows", 
     "alarms",
     "scripting"
-  ],
+    ],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [
