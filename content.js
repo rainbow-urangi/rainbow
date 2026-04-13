@@ -7,10 +7,9 @@
   if (!ALLOWED_HOSTS.includes(location.hostname)) {
     return; // 다른 사이트에서는 아무 것도 하지 않고 종료
   }
-  const INGEST_API_KEY = "local-dev-test-key-12345";
-  // const INGEST_URL = `http://localhost:8080/ingest/batch?api_key=${INGEST_API_KEY}`;
+
   const CONFIG = {
-    TENANT_ID: "test_company",   // ← 배포 시 회사별로 변경
+    // TENANT_ID: "test_company",   // ← 배포 시 회사별로 변경
     CAPTURE_MODE: 'FINAL_ONLY',       // 'FINAL_ONLY' | 'PER_EVENT' | 'BOTH'
     KEY_SAMPLING_MS: 120,
     FINAL_DEBOUNCE_MS: 600
