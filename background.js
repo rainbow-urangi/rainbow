@@ -271,11 +271,11 @@ chrome.webRequest.onBeforeRequest.addListener(
         endTs: null,
         latencyMs: null
       });
-      try {
-        chrome.tabs.sendMessage(details.tabId, { type: "FLUSH_REQUEST" });
-      } catch (e) {
-        // content 쪽이 없을 수도 있으니 무시
-      }
+      // try {
+      //   chrome.tabs.sendMessage(details.tabId, { type: "FLUSH_REQUEST" });
+      // } catch (e) {
+      //   // content 쪽이 없을 수도 있으니 무시
+      // }
     }
   },
   { urls: ["<all_urls>"] }
