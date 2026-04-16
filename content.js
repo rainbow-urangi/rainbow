@@ -777,16 +777,102 @@
     }
     window.__AZ_INSTALL_ID = INSTALL_ID;
   }
+  function isPlausibleLoginId(raw) {
+    const v = (typeof raw === "string" && raw.trim()) ? raw.trim() : "";
+    if (!v) return false;
+    if (v.length < 3 || v.length > 128) return false;
+    if (/[\r\n\t]/.test(v)) return false;
+    if (/^\d{4}[-./]\d{2}[-./]\d{2}$/.test(v)) return false;
+    if (/^\d{4}[-./]\d{2}[-./]\d{2}\s*-\s*\d{4}[-./]\d{2}[-./]\d{2}$/.test(v)) return false;
+    return true;
+  }
+  function isLoginForm(root) {
+    try {
+      const form = root instanceof HTMLFormElement ? root : (root instanceof Element ? root.closest("form") : null);
+      const scope = form || (root instanceof Document ? root : document);
+
+      if (scope?.querySelector?.('input[type="password"]')) return true;
+
+      const pathText = `${location.pathname || ""} ${location.hash || ""}`.toLowerCase();
+      if (/(^|[/?#_-])(login|signin|sign-in|auth)([/?#_-]|$)/.test(pathText)) return true;
+
+      const fingerprint = [
+        form?.getAttribute?.("action") || "",
+        form?.getAttribute?.("name") || "",
+        form?.id || "",
+        typeof form?.className === "string" ? form.className : "",
+        form?.textContent || "",
+      ].join(" ").toLowerCase();
+
+      return /(login|signin|sign in|auth|로그인|아이디|비밀번호)/.test(fingerprint);
+    } catch {
+      return false;
+    }
+  }
+
+  function scoreLoginField(field, scope) {
+    if (!(field instanceof HTMLInputElement)) return -1;
+    if (field.disabled || field.readOnly) return -1;
+
+    const type = (field.type || "text").toLowerCase();
+    if (!["text", "email", "number", "tel"].includes(type) && field.hasAttribute("type")) return -1;
+
+    const value = (field.value || "").trim();
+    if (!isPlausibleLoginId(value)) return -1;
+
+    const meta = [
+      field.getAttribute("name") || "",
+      field.id || "",
+      field.getAttribute("placeholder") || "",
+      field.getAttribute("autocomplete") || "",
+      ...(field.labels ? [...field.labels].map((label) => label.textContent || "") : []),
+    ].join(" ").toLowerCase();
+
+    let score = 0;
+    if (/(login|userid|username|user|email|account|아이디|사번)/.test(meta)) score += 4;
+    if ((field.getAttribute("autocomplete") || "").toLowerCase() === "username") score += 5;
+    if (type === "email") score += 2;
+    if (scope?.querySelector?.('input[type="password"]')) score += 2;
+    if (field === document.activeElement) score += 1;
+    return score;
+  }
+
+  function pickLoginCandidate(root) {
+    try {
+      const scope = root instanceof HTMLFormElement
+        ? root
+        : (root instanceof Document ? root : (root?.closest?.("form") || root));
+      const fields = [...scope.querySelectorAll('input[type="text"],input[type="email"],input[type="number"],input[type="tel"],input:not([type])')];
+
+      let best = null;
+      for (const field of fields) {
+        const score = scoreLoginField(field, scope);
+        if (score < 0) continue;
+        const value = (field.value || "").trim().slice(0, 128);
+        if (!best || score > best.score) best = { value, score };
+      }
+
+      return best && best.score >= 3 ? best.value : null;
+    } catch {
+      return null;
+    }
+  }
+
   async function loadLoginId(){
     try{
       const { loginId } = await chrome.storage.local.get("loginId");
       const s = (typeof loginId==="string" && loginId.trim()) ? loginId.trim() : null;
-      if (s) LOGIN_ID = s.slice(0,128);
-    }catch{}
+      if (s && isPlausibleLoginId(s)) {
+        LOGIN_ID = s.slice(0,128);
+      } else if (s) {
+        await chrome.storage.local.remove("loginId");
+      }
+    } catch {}
   }
+
   function stageLoginId(raw) {
     const v = (typeof raw === 'string' && raw.trim()) ? raw.trim().slice(0, 128) : null;
-    if (!v) return null;
+    if (!v || !isPlausibleLoginId(v)) return null;
     PENDING_LOGIN_ID = v;
     return v
   }
@@ -801,27 +887,10 @@
   }
   function guessLoginId(){
     try{
-      const candidates = [...document.querySelectorAll('input,textarea')];
-      const score = f =>{
-        const n=(f.getAttribute('name')||'').toLowerCase();
-        const i=(f.id||'').toLowerCase();
-        const p=(f.getAttribute('placeholder')||'').toLowerCase();
-        const t=(f.type||'').toLowerCase();
-        let s=0;
-        if (/(login|userid|user|email|account|아이디|사번)/.test(n+i+p)) s+=2;
-        if (t==='text' || t==='email') s+=1;
-        if ((f.value||'').length>=3) s+=2;
-        return s;
-      };
-      const field = candidates.sort((a,b)=>score(b)-score(a))[0];
-      const val = (field?.value||'').trim();
-      if (val) {
-        const v = val.slice(0,128);
-        chrome.storage.local.set({ loginId: v });
-        LOGIN_ID = v;
-        commitLoginId(v);
-      }
-    }catch{}
+      if (!isLoginForm(document)) return;
+      const candidate = pickLoginCandidate(document);
+      if (candidate) stageLoginId(candidate);
+    } catch {}
   }
   /*
   CHANGE NOTE: code_after 에는 클라이언트 workflow index 저장/복원 개념이 없었습니다.
@@ -855,33 +924,19 @@
   function captureLoginIdOnSubmit(){
     addEventListener('submit', (e)=>{
       const f = e.target instanceof HTMLFormElement ? e.target : null;
-      if (!f) return;
-      const idField = f.querySelector('input[type="text"],input[type="email"],input[name*="id"],input[name*="user"],input[name*="login"]');
-      const val = (idField?.value||'').trim();
-      if (val) {
-        const v = val.slice(0,128);
-        chrome.storage.local.set({ loginId: v });
-        LOGIN_ID = v;
-      }
-      if (val) stageLoginId(val);
+      if (!f || !isLoginForm(f)) return;
+      const candidate = pickLoginCandidate(f);
+      if (candidate) stageLoginId(candidate);
     }, true);
   }
   function captureLoginIdOnBlur() {
     addEventListener('blur', (e) => {
       const el = e.target;
       if (!(el instanceof HTMLInputElement)) return;
-      const t = (el.type || '').toLowerCase();
-      if (t !== 'text' && t !== 'email') return;
-      const n = (el.getAttribute('name') || '').toLowerCase();
-      const i = (el.id || '').toLowerCase();
-      const p = (el.getAttribute('placeholder') || '').toLowerCase();
-      if (!/(login|userid|user|email|account|아이디|사번)/.test(n+i+p)) return;
-      const val = (el.value || '').trim();
-      if (val.length < 3) return;
-      const v = val.slice(0, 128);
-      chrome.storage.local.set({ loginId: v });
-      LOGIN_ID = v;
-      stageLoginId(val);
+      const scope = el.form || document;
+      if (!isLoginForm(scope)) return;
+      const candidate = pickLoginCandidate(scope);
+      if (candidate) stageLoginId(candidate);
     }, true); // capture:true → onBlur buildRow 이전에 실행
   }
   async function handshake() {
@@ -1235,6 +1290,7 @@
   function onSubmit(e) {
     const f = e.target instanceof HTMLFormElement ? e.target : null;
     if (!f) return;
+    const loginCandidate = isLoginForm(f) ? pickLoginCandidate(f) : null;
 
     // 실제 submit 요소 찾기
     const submitter = e.submitter instanceof Element ? e.submitter : null;
@@ -1245,11 +1301,12 @@
     const submitterText = submitterBase ? visibleTextOf(submitterBase) : null;
     
     withDomSnapshot(f, snap => {
+      if (loginCandidate) commitLoginId(loginCandidate);
       const row = buildRow(f, 'event', 'submit', null, { snapshot: snap });
       // 텍스트 보강
       if (submitterText) row.AZ_element_text = submitterText;
       sendRows([row]);
-      commitLoginId();
+      // commitLoginId();
       incrementWorkflowIndex(); // submit 경계 → 다음 이벤트부터 새 워크플로우
     });
   }

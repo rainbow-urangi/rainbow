@@ -3,10 +3,10 @@
 /***** 업로드/내보내기 설정 *****/
 // ⚠️ LOCAL DEV TEST ENVIRONMENT
 const REALTIME_UPLOAD = true;
-const INGEST_URL = "http://125.177.146.253:2241/ingest/batch";
-const INGEST_API_KEY = "9F2A4C7D1E8B0FA3D6C4B1E7A9F03D2";
-// const INGEST_URL = "http://192.168.131.128:8080/ingest/batch";
-//const INGEST_API_KEY = "test_key";
+// const INGEST_URL = "http://125.177.146.253:2241/ingest/batch";
+// const INGEST_API_KEY = "9F2A4C7D1E8B0FA3D6C4B1E7A9F03D2";
+const INGEST_URL = "http://192.168.131.128:8080/ingest/batch";
+const INGEST_API_KEY = "test_key";
 
 /***** 업로드 큐/히스토리 *****/
 // CSV 내보내기용 히스토리(비우지 않음)
