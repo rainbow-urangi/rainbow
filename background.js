@@ -1,12 +1,10 @@
 // background.js — Unified: 기존 CSV/디버그/변환 로직 유지 + rows 직행 업로드 + 재시도 큐 + 영속 브라우저 ID
 
 /***** 업로드/내보내기 설정 *****/
-// ⚠️ LOCAL DEV TEST ENVIRONMENT
+// ⚠️ PROD INGEST
 const REALTIME_UPLOAD = true;
-// const INGEST_URL = "http://125.177.146.253:2241/ingest/batch";
-// const INGEST_API_KEY = "9F2A4C7D1E8B0FA3D6C4B1E7A9F03D2";
-const INGEST_URL = "http://192.168.131.128:8080/ingest/batch";
-const INGEST_API_KEY = "test_key";
+const INGEST_URL = "https://rainbowlab.ai.kr/ingest/batch";
+const INGEST_API_KEY = "9F2A4C7D1E8B0FA3D6C4B1E7A9F03D2";
 
 /***** 업로드 큐/히스토리 *****/
 // CSV 내보내기용 히스토리(비우지 않음)
@@ -14,7 +12,45 @@ const DB_BUFFER = [];
 // 서버 업로드용 큐(실패 시 재시도)
 const UPLOAD_QUEUE = [];
 let uploadTimer = null;
+let uploadInFlight = false;
+let uploadQueueHydrated = false;
 const UPLOAD_INTERVAL_MS = 3000;
+const UPLOAD_QUEUE_KEY = "AZ_PENDING_UPLOAD_ROWS";
+const UPLOAD_QUEUE_WAKE_ALARM = "AZ_UPLOAD_QUEUE_WAKE";
+const UPLOAD_QUEUE_WAKE_PERIOD_MINUTES = 1;
+
+async function hydrateUploadQueue() {
+  if (uploadQueueHydrated) return;
+  try {
+    const got = await chrome.storage.local.get(UPLOAD_QUEUE_KEY);
+    const pending = Array.isArray(got?.[UPLOAD_QUEUE_KEY]) ? got[UPLOAD_QUEUE_KEY] : [];
+    if (pending.length) UPLOAD_QUEUE.push(...pending);
+  } catch (e) {
+    console.warn("[INGEST] queue hydrate failed", e);
+  } finally {
+    uploadQueueHydrated = true;
+  }
+}
+
+async function enqueueUploadRows(rows) {
+  if (!Array.isArray(rows) || !rows.length) return;
+  await hydrateUploadQueue();
+  UPLOAD_QUEUE.push(...rows);
+  await persistUploadQueue();
+}
+
+async function persistUploadQueue() {
+  try {
+    await chrome.storage.local.set({ [UPLOAD_QUEUE_KEY]: UPLOAD_QUEUE });
+  } catch (e) {
+    console.warn("[INGEST] queue persist failed", e);
+  }
+}
+
+void ensureUploadQueueWakeAlarm();
+void hydrateUploadQueue().then(() => {
+  if (UPLOAD_QUEUE.length) scheduleUpload();
+});
 
 // 탭 종료 상태 기록
 // GIT HISTORY NOTE (2ec7e8b -> 5918e02)
@@ -344,6 +380,41 @@ function scheduleUpload() {
   uploadTimer = setTimeout(flushUpload, UPLOAD_INTERVAL_MS);
 }
 
+async function ensureUploadQueueWakeAlarm() {
+  if (!chrome.alarms?.create) return;
+  try {
+    await chrome.alarms.create(UPLOAD_QUEUE_WAKE_ALARM, {
+      periodInMinutes: UPLOAD_QUEUE_WAKE_PERIOD_MINUTES
+    });
+  } catch (e) {
+    console.warn("[INGEST] queue wake alarm setup failed", e);
+  }
+}
+
+async function wakeUploadQueue(reason = "alarm") {
+  await hydrateUploadQueue();
+  if (!UPLOAD_QUEUE.length) return;
+  console.info("[INGEST] queue wake flush", { reason, pendingRows: UPLOAD_QUEUE.length });
+  scheduleUpload();
+}
+
+if (chrome.alarms?.onAlarm) {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm?.name !== UPLOAD_QUEUE_WAKE_ALARM) return;
+    void wakeUploadQueue("alarm");
+  });
+}
+
+chrome.runtime.onInstalled?.addListener(() => {
+  void ensureUploadQueueWakeAlarm();
+  void wakeUploadQueue("runtime_installed");
+});
+
+chrome.runtime.onStartup?.addListener(() => {
+  void ensureUploadQueueWakeAlarm();
+  void wakeUploadQueue("runtime_startup");
+});
+
 /*
 CHANGE NOTE: code_after 의 flushUpload 는 단순 업로드 함수였습니다.
 현재는 종료 시 keepalive 전송을 의도하는 isFinal 인자를 받습니다.
@@ -400,10 +471,12 @@ LEGACY_FROM_2ec7e8b: duplicate-upload reproduction helper
 - keepalive 추가 의도는 "창 종료 전 마지막 배치 손실 감소"입니다.
 */
 async function flushUpload(isFinal = false) {
+  await hydrateUploadQueue();
   uploadTimer = null;
-  if (!UPLOAD_QUEUE.length) return;
+  if (uploadInFlight || !UPLOAD_QUEUE.length) return;
 
-  const rows = UPLOAD_QUEUE.splice(0, UPLOAD_QUEUE.length);
+  uploadInFlight = true;
+  const rows = UPLOAD_QUEUE.slice();
   try {
     const body = JSON.stringify({ rows, ts: Date.now() });
     const headers = { "Content-Type": "application/json" };
@@ -418,18 +491,23 @@ async function flushUpload(isFinal = false) {
       console.warn("[INGEST] non-200", res.status, t);
       throw new Error(String(res.status));
     }
+    UPLOAD_QUEUE.splice(0, rows.length);
+    await persistUploadQueue();
   } catch (e) {
     console.warn("[INGEST] failed, re-queue", e);
-    // 실패 시 재큐
-    UPLOAD_QUEUE.unshift(...rows);
     scheduleUpload();
+  } finally {
+    uploadInFlight = false;
   }
 }
 function realtimeUpload(rows, reason) {
   if (!REALTIME_UPLOAD || !Array.isArray(rows) || !rows.length) return;
-  UPLOAD_QUEUE.push(...rows);
-  // 저지연 업로드 지향 (실패 시 flushUpload 안에서 재큐 후 scheduleUpload)
-  flushUpload();
+  void enqueueUploadRows(rows).then(() => {
+    if (uploadInFlight) scheduleUpload();
+    else void flushUpload();
+  }).catch((e) => {
+    console.warn("[INGEST] enqueue failed", e);
+  });
 }
 
 /***** 콘솔 로깅 + 히스토리(DB_BUFFER) 보존 *****/
