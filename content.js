@@ -2,7 +2,7 @@
 
 (() => {
   // ───────────────── Config ─────────────────
-  const ALLOWED_HOSTS = ["c4web.c4mix.com"];
+  const ALLOWED_HOSTS = ["c4web.c4mix.com", "aiqbot.tomatosystem.co.kr"];
   // const ALLOWED_HOSTS = ["jcampusv2.jangan.ac.kr", "jangan.ap.panopto.com"];
   if (!ALLOWED_HOSTS.includes(location.hostname)) {
     return; // 다른 사이트에서는 아무 것도 하지 않고 종료
@@ -17,7 +17,12 @@
   const SNAPSHOT = {
     ENABLED: true,
     AFTER_DELAY_MS: 250,
-    MAX_CHARS: 500000
+    MAX_CHARS: 500000,
+    STRUCTURED_ENABLED: true,
+    STRUCTURED_MAX_FIELDS: 80,
+    STRUCTURED_MAX_GRID_ROWS: 20,
+    STRUCTURED_MAX_GRID_CELLS: 240,
+    STRUCTURED_MAX_VALUE_CHARS: 500
   };
 
   let isUnloading = false;
@@ -77,10 +82,21 @@
   //  (B) 입력 필드의 라벨/placeholder → events.associated_label
   const MAX_ELEMENT_TEXT_CHARS = 2048;
   const MAX_ASSOC_LABEL_CHARS  = 2048;
+  const FIELD_CONTEXT_TTL_MS = 2000;
+  const FIELD_CONTEXT_MAX = 20;
+  const FIELD_CONTEXTS = new Map();
+  const VALUE_REFLECTION_WINDOW_MS = 1500;
+  const VALUE_REFLECTION_CHECK_DELAYS_MS = [80, 250, 700, 1400];
+  const VALUE_REFLECTION_MAX_CANDIDATES = 80;
+  const RECENT_VALUE_EVENT_WINDOW_MS = 1800;
+  const RECENT_VALUE_EVENTS = new WeakMap();
+  const RECENT_VALUE_REFLECTION_KEYS = new Map();
+  const POPUP_ROOT_SELECTOR = 'dialog[open], [aria-modal="true"], [role="dialog"], [role="alertdialog"], .modal, .popup, .layer, .layer-popup';
 
   // 클릭 가능한 요소(버튼/링크 등). 클릭 시 e.target이 span/icon일 수 있어 closest로 끌어올려 사용
   const CLICKABLE_SELECTOR =
     'button,a,[role="button"],[role="link"],[role="menuitem"],[role="tab"],' +
+    '[role="radio"],[role="checkbox"],[role="switch"],[role="combobox"],[role="option"],' +
     'input[type="button"],input[type="submit"],input[type="reset"],input[type="image"]';
 
   function clampText(s, maxLen){
@@ -88,6 +104,122 @@
     const t = String(s).replace(/\s+/g, ' ').trim();
     if (!t) return null;
     return t.length > maxLen ? t.slice(0, maxLen) : t;
+  }
+
+  function isTechnicalLabelText(v) {
+    const t = clampText(v, MAX_ASSOC_LABEL_CHARS);
+    if (!t) return false;
+    return /^[A-Za-z0-9_-]+\/p\/text$/.test(t) ||
+      /^uuid-[A-Za-z0-9_-]+$/.test(t) ||
+      /^f\d+$/.test(t) ||
+      /^e[a-z0-9]+$/i.test(t);
+  }
+
+  function cleanAssociatedLabel(v) {
+    const t = clampText(v, MAX_ASSOC_LABEL_CHARS);
+    if (!t || isTechnicalLabelText(t)) return null;
+    return t;
+  }
+
+  function isPlaceholderLike(el) {
+    return el instanceof Element &&
+      !!el.closest?.('.cl-form-placeholder,[data-role="placeholder"]');
+  }
+
+  function isFieldCommitElement(el) {
+    if (!(el instanceof Element)) return false;
+    const role = (el.getAttribute?.('role') || '').toLowerCase();
+    return role === 'option' || role === 'radio' || role === 'checkbox' || role === 'switch';
+  }
+
+  function controlKeyOf(el) {
+    if (!(el instanceof Element)) return null;
+
+    const fromId = (id) => {
+      const m = String(id || '').match(/^(.+?)\/p\/(?:text|button|i\d+|list)$/);
+      return m ? `idp:${m[1]}` : null;
+    };
+
+    const direct = fromId(el.id);
+    if (direct) return direct;
+
+    for (const attr of ['aria-controls', 'aria-owns', 'aria-activedescendant']) {
+      const key = fromId(el.getAttribute?.(attr));
+      if (key) return key;
+    }
+
+    const field = resolveFrameworkField(el);
+    const fieldKey = fromId(field?.id);
+    if (fieldKey) return fieldKey;
+
+    const owner = el.closest?.(
+      '[role="radiogroup"],[data-role="radiogroup"],.cl-radiobutton,.cl-combobox,.cl-inputbox'
+    );
+    if (owner?.id) return `owner:${owner.id}`;
+    if (field?.id) return `id:${field.id}`;
+    if (field?.getAttribute?.('name')) return `name:${field.getAttribute('name')}`;
+
+    return null;
+  }
+
+  function pruneFieldContexts(now = Date.now()) {
+    for (const [key, ctx] of FIELD_CONTEXTS) {
+      if (now - ctx.ts > FIELD_CONTEXT_TTL_MS) FIELD_CONTEXTS.delete(key);
+    }
+    while (FIELD_CONTEXTS.size > FIELD_CONTEXT_MAX) {
+      FIELD_CONTEXTS.delete(FIELD_CONTEXTS.keys().next().value);
+    }
+  }
+
+  function rememberFieldContext(el) {
+    const key = controlKeyOf(el);
+    if (!key) return;
+
+    const field = resolveFrameworkField(el) || el;
+    const label =
+      cleanAssociatedLabel(associatedLabelOfAny(field)) ||
+      cleanAssociatedLabel(findNearbyLabel(field));
+
+    if (!label) return;
+
+    FIELD_CONTEXTS.set(key, { ts: Date.now(), label });
+    pruneFieldContexts();
+  }
+
+  function consumeFieldContext(el) {
+    pruneFieldContexts();
+    const key = controlKeyOf(el);
+    if (!key) return null;
+
+    const ctx = FIELD_CONTEXTS.get(key);
+    if (!ctx) return null;
+
+    FIELD_CONTEXTS.delete(key);
+    return ctx;
+  }
+
+  function enrichFieldCommitRow(row, el) {
+    if (!row || !(el instanceof Element)) return row;
+
+    const isCommit = isFieldCommitElement(el);
+    const ctx = isCommit ? consumeFieldContext(el) : null;
+    const rowLabel = cleanAssociatedLabel(row.AZ_associated_label);
+    const label = (isCommit ? ctx?.label : null) || rowLabel;
+    const value =
+      row.AZ_data ??
+      visibleTextOf(el) ??
+      extractBestValue(el) ??
+      textOf(el);
+
+    row.AZ_associated_label = label || null;
+
+    if (isCommit && value !== null && value !== undefined) {
+      row.AZ_data = maskValue(el, value);
+      row.AZ_element_text = row.AZ_element_text || String(value);
+      row.AZ_event_subtype = row.AZ_event_subtype || 'field_commit';
+    }
+
+    return row;
   }
 
   function isClickableElement(el){
@@ -107,6 +239,7 @@
   // "사용자에게 보이는" 텍스트: innerText 우선 + fallback(textContent/aria-label)
   function visibleTextOf(el){
     if (!(el instanceof Element)) return null;
+    const role = (el.getAttribute?.('role') || '').toLowerCase();
 
     // input[type=button|submit|reset]은 value가 화면 텍스트
     if ((el.tagName || '').toLowerCase() === 'input') {
@@ -115,6 +248,15 @@
         const v = clampText(el.value, MAX_ELEMENT_TEXT_CHARS);
         if (v) return v;
       }
+      if (!['password', 'hidden'].includes(type)) {
+        const v = clampText(el.value, MAX_ELEMENT_TEXT_CHARS);
+        if (v) return v;
+      }
+    }
+
+    if ((el.tagName || '').toLowerCase() === 'textarea') {
+      const v = clampText(el.value, MAX_ELEMENT_TEXT_CHARS);
+      if (v) return v;
     }
 
     if ((el.tagName || '').toLowerCase() === 'select') {
@@ -122,6 +264,21 @@
       if (selectedTexts.length > 0) {
         return clampText(selectedTexts.join(', '), MAX_ELEMENT_TEXT_CHARS);
       }
+    }
+
+    if (role === 'radio' || role === 'checkbox' || role === 'switch') {
+      const aria = clampText(el.getAttribute?.('aria-label') || null, MAX_ELEMENT_TEXT_CHARS);
+      if (aria) return aria;
+    }
+
+    if (role === 'radiogroup') {
+      const selected = el.querySelector?.('[role="radio"][aria-checked="true"], [role="checkbox"][aria-checked="true"], [role="switch"][aria-checked="true"]');
+      const selectedText = clampText(
+        visibleTextOf(selected) ||
+        textOf(selected?.closest?.('.cl-radiobutton-item,[data-region="colgroup"]') || selected),
+        MAX_ELEMENT_TEXT_CHARS
+      );
+      if (selectedText) return selectedText;
     }
 
     let t = null;
@@ -140,8 +297,143 @@
     if (!(el instanceof Element)) return false;
     const tag = (el.tagName || '').toLowerCase();
     if (tag === 'input' || tag === 'textarea' || tag === 'select') return true;
+    const role = (el.getAttribute?.('role') || '').toLowerCase();
+    if (role && /combobox|textbox|searchbox|spinbutton/.test(role)) return true;
     if (el.isContentEditable) return true;
     return false;
+  }
+
+  function labelledByText(el, maxLen = MAX_ASSOC_LABEL_CHARS) {
+    if (!(el instanceof Element)) return null;
+    const ids = (el.getAttribute?.('aria-labelledby') || '').trim();
+    if (!ids) return null;
+    const parts = ids
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((id) => document.getElementById(id))
+      .filter(Boolean)
+      .map((node) => clampText(visibleTextOf(node) || textOf(node), maxLen))
+      .filter(Boolean);
+    return parts.length ? clampText(parts.join(' '), maxLen) : null;
+  }
+
+  function findNearbyLabel(root, maxLen = MAX_ASSOC_LABEL_CHARS) {
+    const clean = (v) => clampText(v, maxLen);
+    if (!(root instanceof Element)) return null;
+
+    let prev = root.previousElementSibling;
+    let depth = 0;
+    while (prev && depth < 4) {
+      const t = clean(visibleTextOf(prev) || textOf(prev));
+      if (t) return t;
+      prev = prev.previousElementSibling;
+      depth += 1;
+    }
+
+    try {
+      const container =
+        root.closest('.form-group,.field,.field-row,.row,td,th,div,form,fieldset,[class*="field"],[class*="form"]') ||
+        null;
+      if (!container) return null;
+
+      const nodes = [
+        ...container.querySelectorAll(
+          'label,[role="label"],.label,[class*="label"],.title,[class*="title"],h1,h2,h3,h4,h5,h6,p,.cl-output'
+        ),
+      ].filter((node) => node && node !== root && !root.contains(node));
+
+      const prior = nodes.filter(
+        (node) => (node.compareDocumentPosition(root) & Node.DOCUMENT_POSITION_FOLLOWING)
+      );
+
+      for (let i = prior.length - 1; i >= 0; i--) {
+        const t = clean(visibleTextOf(prior[i]) || textOf(prior[i]));
+        if (t) return t;
+      }
+
+      for (let i = nodes.length - 1; i >= 0; i--) {
+        const t = clean(visibleTextOf(nodes[i]) || textOf(nodes[i]));
+        if (t) return t;
+      }
+    } catch {}
+
+    return null;
+  }
+
+  function resolveFrameworkField(el) {
+    if (!(el instanceof Element)) return null;
+    if (isInputLike(el)) return el;
+
+    const role = (el.getAttribute?.('role') || '').toLowerCase();
+    if (role === 'radio' || role === 'checkbox' || role === 'switch') return el;
+
+    const comboRoot = el.closest('[role="combobox"],.cl-combobox,.cl-inputbox');
+    if (comboRoot) {
+      if (comboRoot.matches('[role="combobox"],input,textarea,select')) return comboRoot;
+      const comboField = comboRoot.querySelector?.('[role="combobox"],input,textarea,select,[contenteditable="true"]');
+      if (comboField instanceof Element) return comboField;
+      return comboRoot;
+    }
+
+    const radioItem = el.closest('[role="radio"],.cl-radiobutton-item,.cl-radiobutton-field,.cl-radiobutton');
+    if (radioItem) {
+      if (radioItem.matches('[role="radio"]')) return radioItem;
+      const selectedRadio = radioItem.querySelector?.('[role="radio"][aria-checked="true"],[role="radio"],input[type="radio"],input[type="checkbox"]');
+      if (selectedRadio instanceof Element) return selectedRadio;
+      return radioItem;
+    }
+
+    const radioGroup = el.closest('[role="radiogroup"],[data-role="radiogroup"]');
+    if (radioGroup) {
+      const selectedRadio = radioGroup.querySelector?.('[role="radio"][aria-checked="true"],[role="radio"]');
+      if (selectedRadio instanceof Element) return selectedRadio;
+      return radioGroup;
+    }
+
+    return el;
+  }
+
+  function associatedLabelOfAny(el) {
+    if (!(el instanceof Element)) return null;
+
+    if (isInputLike(el)) {
+      const nativeLabel = cleanAssociatedLabel(associatedLabelOf(el));
+      if (nativeLabel) return nativeLabel;
+    }
+
+    const resolved = resolveFrameworkField(el);
+    if (resolved && resolved !== el && isInputLike(resolved)) {
+      const resolvedLabel = cleanAssociatedLabel(associatedLabelOf(resolved));
+      if (resolvedLabel) return resolvedLabel;
+    }
+
+    if (resolved?.matches?.('[role="combobox"],[role="textbox"],[role="searchbox"]')) {
+      const aria = cleanAssociatedLabel(resolved.getAttribute?.('aria-label') || null);
+      if (aria) return aria;
+      const labelled = cleanAssociatedLabel(labelledByText(resolved));
+      if (labelled) return labelled;
+      const nearby = cleanAssociatedLabel(findNearbyLabel(resolved));
+      if (nearby) return nearby;
+    }
+
+    const group =
+      resolved?.closest?.('[role="radiogroup"],[data-role="radiogroup"],.cl-radiobutton') ||
+      (resolved?.matches?.('[role="radiogroup"],[data-role="radiogroup"],.cl-radiobutton') ? resolved : null);
+    if (group instanceof Element) {
+      const groupAria = cleanAssociatedLabel(group.getAttribute?.('aria-label') || null);
+      if (groupAria) return groupAria;
+      const groupLabelled = cleanAssociatedLabel(labelledByText(group));
+      if (groupLabelled) return groupLabelled;
+      const groupNearby = cleanAssociatedLabel(findNearbyLabel(group));
+      if (groupNearby) return groupNearby;
+    }
+
+    if (resolved?.matches?.('[role="radio"],[role="checkbox"],[role="switch"]')) {
+      const nearby = cleanAssociatedLabel(findNearbyLabel(resolved));
+      if (nearby) return nearby;
+    }
+
+    return null;
   }
 
   // GIT HISTORY NOTE (2ec7e8b -> 5918e02)
@@ -615,6 +907,56 @@
       return chain;
     }catch{ return []; }
   }
+  function buildFrameContext() {
+    let isTopFrame = true;
+    let crossOriginLimited = false;
+    let topUrl = null;
+    let topOrigin = null;
+    let frameDepth = 0;
+    let frameIndex = null;
+
+    try {
+      isTopFrame = window.top === window;
+    } catch {
+      isTopFrame = false;
+      crossOriginLimited = true;
+    }
+
+    try {
+      topUrl = window.top?.location?.href || null;
+      topOrigin = window.top?.location?.origin || null;
+    } catch {
+      crossOriginLimited = true;
+    }
+
+    try {
+      let current = window;
+      while (current?.parent && current.parent !== current && frameDepth < 20) {
+        const parent = current.parent;
+        try {
+          frameIndex = Array.prototype.indexOf.call(parent.frames || [], current);
+        } catch {
+          crossOriginLimited = true;
+        }
+        frameDepth += 1;
+        current = parent;
+      }
+    } catch {
+      crossOriginLimited = true;
+    }
+
+    return {
+      is_top_frame: Boolean(isTopFrame),
+      frame_depth: frameDepth,
+      frame_index: Number.isFinite(Number(frameIndex)) ? Number(frameIndex) : null,
+      frame_url: location.href,
+      frame_origin: location.origin,
+      top_url: topUrl,
+      top_origin: topOrigin,
+      referrer: document.referrer || null,
+      cross_origin_limited: Boolean(crossOriginLimited)
+    };
+  }
   function isToggleInput(el){
     if (!(el instanceof Element)) return false;
     const tag = (el.tagName || '').toLowerCase();
@@ -629,19 +971,58 @@
   function isSensitive(el){
     const type=(el?.getAttribute?.('type')||"").toLowerCase();
     const name=(el?.getAttribute?.('name')||"").toLowerCase();
-    return type==="password" || /pass|pwd|ssn|credit|주민|비번/i.test(name);
+    const id=(el?.getAttribute?.('id')||"").toLowerCase();
+    const placeholder=(el?.getAttribute?.('placeholder')||"").toLowerCase();
+    const aria=(el?.getAttribute?.('aria-label')||"").toLowerCase();
+    const autocomplete=(el?.getAttribute?.('autocomplete')||"").toLowerCase();
+    const haystack = [type, name, id, placeholder, aria, autocomplete].join(' ');
+    return /password|pass|pwd|ssn|credit|card|account|bank|token|secret|auth|email|phone|tel|mobile|주민|비번|비밀번호|카드|계좌|토큰|인증|전화|휴대폰|이메일/i.test(haystack);
   }
   function maskValue(el, v){
     if (isSensitive(el)) return "*****";
     return v;
   }
+  function simpleHashText(value) {
+    const text = String(value || '').slice(0, 1500);
+    let hash = 0;
+    for (let i = 0; i < text.length; i += 1) {
+      hash = ((hash << 5) - hash) + text.charCodeAt(i);
+      hash |= 0;
+    }
+    return String(hash);
+  }
   function normalizeInputValue(el) {
     if (!el) return null;
     const tag = (el.tagName || '').toLowerCase();
     const type = (el.getAttribute && el.getAttribute('type') || '').toLowerCase();
+    const role = (el.getAttribute?.('role') || '').toLowerCase();
     if (tag === 'input' && /password/i.test(type)) return null;
     if (tag === 'input' && (type === 'checkbox' || type === 'radio')) {
       return el.checked ? (el.value || 'on') : 'off';
+    }
+    if (role === 'radio' || role === 'checkbox' || role === 'switch') {
+      const checked = (el.getAttribute?.('aria-checked') || '').toLowerCase() === 'true';
+      if (!checked) return 'off';
+      return el.getAttribute?.('aria-label') || el.getAttribute?.('data-value') || 'on';
+    }
+    if (role === 'radiogroup') {
+      const selected = el.querySelector?.('[role="radio"][aria-checked="true"],[role="checkbox"][aria-checked="true"],[role="switch"][aria-checked="true"]');
+      return normalizeInputValue(selected);
+    }
+    if (role === 'combobox' || role === 'textbox' || role === 'searchbox' || role === 'spinbutton') {
+      const direct = el.value ?? el.getAttribute?.('value');
+      if (direct) return direct;
+
+      const activeId = el.getAttribute?.('aria-activedescendant');
+      const activeEl = activeId ? document.getElementById(activeId) : null;
+      const activeText = activeEl ? (visibleTextOf(activeEl) || textOf(activeEl)) : null;
+      if (activeText) return activeText;
+
+      const selected = el.closest?.('.cl-combobox,.cl-inputbox,[role="combobox"]')
+        ?.querySelector?.('[role="option"][aria-selected="true"],.cl-selected [role="text"],.cl-selected .cl-text');
+      if (selected instanceof Element) return visibleTextOf(selected) || textOf(selected);
+
+      return textOf(el);
     }
     if (tag === 'input' || tag === 'textarea') return el.value ?? null;
     if (tag === 'select') {
@@ -682,6 +1063,252 @@
     return null;
   }
 
+  function isVisibleElement(el) {
+    if (!(el instanceof Element)) return false;
+    const rect = el.getBoundingClientRect();
+    if (rect.width <= 0 && rect.height <= 0) return false;
+    const style = getComputedStyle(el);
+    return style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0';
+  }
+
+  function visiblePopupRoots() {
+    return Array.from(document.querySelectorAll(POPUP_ROOT_SELECTOR))
+      .filter(isVisibleElement)
+      .slice(0, 20)
+      .sort((a, b) => {
+        const za = Number(getComputedStyle(a).zIndex) || 0;
+        const zb = Number(getComputedStyle(b).zIndex) || 0;
+        if (za !== zb) return za - zb;
+        return a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1;
+      });
+  }
+
+  function popupContextOf(el) {
+    const roots = visiblePopupRoots();
+    if (!roots.length) return null;
+    const activeRoot = el instanceof Element
+      ? (el.closest?.(POPUP_ROOT_SELECTOR) || roots[roots.length - 1])
+      : roots[roots.length - 1];
+    const stack = roots.map((root, index) => ({
+      popup_id: root.id ? `popup:${root.id}` : `popup:${cssPath(root) || index + 1}`,
+      depth: index + 1,
+      selector_css: cssPath(root),
+      role: root.getAttribute?.('role') || null,
+      title: clampText(
+        root.getAttribute?.('aria-label') ||
+        textOf(root.querySelector?.('h1,h2,h3,.modal-title,.dialog-title,[role="heading"]')) ||
+        textOf(root),
+        160
+      )
+    }));
+    const activeSelector = activeRoot ? cssPath(activeRoot) : null;
+    const active = stack.find((item) => item.selector_css === activeSelector) || stack[stack.length - 1];
+    return {
+      stack_depth: stack.length,
+      is_inside_popup: Boolean(el instanceof Element && el.closest?.(POPUP_ROOT_SELECTOR)),
+      active_popup_id: active?.popup_id || null,
+      active_popup_depth: active?.depth ?? null,
+      active_popup_title: active?.title || null,
+      stack
+    };
+  }
+
+  function isValueReflectionTarget(el) {
+    if (!isInputLike(el) || isToggleInput(el) || isSensitive(el)) return false;
+    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) {
+      if (el.disabled || el.readOnly) return false;
+      const type = (el.getAttribute('type') || '').toLowerCase();
+      if (['hidden', 'file', 'password'].includes(type)) return false;
+    }
+    return isVisibleElement(el);
+  }
+
+  function reflectionFingerprint(el) {
+    if (!isValueReflectionTarget(el)) return null;
+    const raw = extractBestValue(el);
+    const text = raw === null || raw === undefined ? '' : String(raw);
+    return {
+      length: text.length,
+      empty: text.length === 0,
+      hash: simpleHashText(`${PAGE_SESSION_ID}:${text}`)
+    };
+  }
+
+  function reflectionTargetLabel(el) {
+    return cleanAssociatedLabel(associatedLabelOfAny(el)) ||
+      cleanAssociatedLabel(el?.getAttribute?.('aria-label')) ||
+      cleanAssociatedLabel(el?.getAttribute?.('placeholder')) ||
+      cleanAssociatedLabel(el?.getAttribute?.('name')) ||
+      cleanAssociatedLabel(el?.id);
+  }
+
+  function queryValueReflectionTargets(sourceEl = null) {
+    const roots = [];
+    if (sourceEl instanceof Element) {
+      const sourcePopup = sourceEl.closest?.(POPUP_ROOT_SELECTOR);
+      if (sourcePopup) roots.push(sourcePopup);
+      const parentPopup = sourcePopup?.parentElement?.closest?.(POPUP_ROOT_SELECTOR);
+      if (parentPopup) roots.push(parentPopup);
+    }
+    roots.push(...visiblePopupRoots().slice().reverse(), document);
+
+    const seen = new Set();
+    const candidates = [];
+    for (const root of roots) {
+      const nodes = root?.querySelectorAll?.('input, textarea, select, [contenteditable="true"], [role="textbox"], [role="combobox"]') || [];
+      for (const node of nodes) {
+        if (!(node instanceof Element) || seen.has(node) || !isValueReflectionTarget(node)) continue;
+        seen.add(node);
+        candidates.push(node);
+        if (candidates.length >= VALUE_REFLECTION_MAX_CANDIDATES) return candidates;
+      }
+    }
+    return candidates;
+  }
+
+  function snapshotValueReflectionTargets(sourceEl = null) {
+    return queryValueReflectionTargets(sourceEl)
+      .map((element) => ({
+        element,
+        selectorCss: cssPath(element),
+        selectorXpath: xPath(element),
+        fingerprint: reflectionFingerprint(element),
+        popupContext: popupContextOf(element)
+      }))
+      .filter((item) => item.fingerprint && item.selectorCss);
+  }
+
+  function rememberRecentValueEvent(el, action) {
+    if (!(el instanceof Element)) return;
+    RECENT_VALUE_EVENTS.set(el, { action, timeMs: Date.now() });
+  }
+
+  function recentlyHadNativeValueEvent(el, sinceMs) {
+    const recent = RECENT_VALUE_EVENTS.get(el);
+    return Boolean(recent?.timeMs && recent.timeMs >= sinceMs - 10 && Date.now() - recent.timeMs <= RECENT_VALUE_EVENT_WINDOW_MS);
+  }
+
+  function pruneReflectionDedupe(now = Date.now()) {
+    for (const [key, emittedAt] of RECENT_VALUE_REFLECTION_KEYS) {
+      if (now - emittedAt > 6000) RECENT_VALUE_REFLECTION_KEYS.delete(key);
+    }
+  }
+
+  function isValueReflectionSourceRow(row) {
+    const action = row?.AZ_event_action || '';
+    const subtype = row?.AZ_event_subtype || '';
+    return action === 'click' || action === 'menu_click' || /business_|field_commit/.test(subtype);
+  }
+
+  function scoreValueReflection({ sourceRow, before, after, sourcePopupContext, targetPopupContext, elapsedMs }) {
+    let score = 0.35;
+    if (elapsedMs >= 0 && elapsedMs <= VALUE_REFLECTION_WINDOW_MS) score += 0.15;
+    if (before.length !== after.length) score += 0.1;
+    if (before.hash !== after.hash) score += 0.1;
+    if (before.empty && !after.empty) score += 0.1;
+    if (sourcePopupContext || targetPopupContext) score += 0.1;
+    if (isValueReflectionSourceRow(sourceRow)) score += 0.1;
+    return Math.min(0.95, Number(score.toFixed(2)));
+  }
+
+  function emitValueReflectionRow(sourceRow, sourceEl, beforeState, afterFingerprint, observedAtMs) {
+    if (!sourceRow || !beforeState?.element || !afterFingerprint) return;
+    const target = beforeState.element;
+    const sourcePopupContext = popupContextOf(sourceEl);
+    const targetPopupContext = popupContextOf(target);
+    const confidence = scoreValueReflection({
+      sourceRow,
+      before: beforeState.fingerprint,
+      after: afterFingerprint,
+      sourcePopupContext,
+      targetPopupContext,
+      elapsedMs: Date.now() - observedAtMs
+    });
+    const context = {
+      source_event_id: sourceRow.AZ_event_id || null,
+      source_interaction_id: sourceRow.AZ_interaction_id || sourceRow.AZ_event_id || null,
+      source_action: sourceRow.AZ_event_action || null,
+      source_popup_id: sourcePopupContext?.active_popup_id || null,
+      source_popup_depth: sourcePopupContext?.active_popup_depth ?? null,
+      target_popup_id: targetPopupContext?.active_popup_id || null,
+      target_popup_depth: targetPopupContext?.active_popup_depth ?? null,
+      target_selector_css: beforeState.selectorCss,
+      target_selector_xpath: beforeState.selectorXpath,
+      target_element_tag: target.tagName?.toLowerCase() || null,
+      target_associated_label: reflectionTargetLabel(target),
+      value_captured: false,
+      value_before_captured: false,
+      value_after_captured: false,
+      value_length_changed: beforeState.fingerprint.length !== afterFingerprint.length,
+      value_hash_changed: beforeState.fingerprint.hash !== afterFingerprint.hash,
+      empty_to_filled: Boolean(beforeState.fingerprint.empty && !afterFingerprint.empty),
+      reason: 'programmatic_input_value_reflection',
+      confidence,
+      candidate_only: confidence < 0.7
+    };
+    const dedupeKey = `${sourceRow.AZ_event_id || sourceRow.AZ_event_time || 'source'}:${beforeState.selectorCss}`;
+    pruneReflectionDedupe();
+    if (RECENT_VALUE_REFLECTION_KEYS.has(dedupeKey)) return;
+    RECENT_VALUE_REFLECTION_KEYS.set(dedupeKey, Date.now());
+
+    const row = buildRow(target, 'input', 'value_reflection', null, {
+      event_subtype: 'programmatic_input_value_reflection',
+      eventTsMs: Date.now()
+    });
+    row.AZ_data = null;
+    row.AZ_input_length = null;
+    row.AZ_element_text = null;
+    row.AZ_associated_label = context.target_associated_label || row.AZ_associated_label || null;
+    row.AZ_locators_json = {
+      ...(row.AZ_locators_json || {}),
+      relation_context: {
+        related_event_id: sourceRow.AZ_event_id || null,
+        related_interaction_id: sourceRow.AZ_interaction_id || sourceRow.AZ_event_id || null,
+        related_action: sourceRow.AZ_event_action || null,
+        related_strategy: 'programmatic_value_reflection'
+      },
+      popup_context: targetPopupContext,
+      value_reflection_context: context
+    };
+    sendRows([row]);
+  }
+
+  function checkValueReflectionTargets(sourceRow, sourceEl, observedAtMs, beforeStates, emittedTargets) {
+    for (const beforeState of beforeStates) {
+      const target = beforeState.element;
+      if (!(target instanceof Element) || !target.isConnected || emittedTargets.has(target)) continue;
+      if (recentlyHadNativeValueEvent(target, observedAtMs)) continue;
+      const after = reflectionFingerprint(target);
+      if (!after) continue;
+      const changed =
+        beforeState.fingerprint.length !== after.length ||
+        beforeState.fingerprint.hash !== after.hash ||
+        beforeState.fingerprint.empty !== after.empty;
+      if (!changed) continue;
+      emittedTargets.add(target);
+      emitValueReflectionRow(sourceRow, sourceEl, beforeState, after, observedAtMs);
+    }
+  }
+
+  function scheduleValueReflectionCheck(sourceRow, sourceEl = null, beforeStates = null) {
+    if (!isValueReflectionSourceRow(sourceRow)) return;
+    const observedAtMs = Date.now();
+    const states = Array.isArray(beforeStates) ? beforeStates : snapshotValueReflectionTargets(sourceEl);
+    if (!states.length) return;
+    const emittedTargets = new WeakSet();
+    for (const delayMs of VALUE_REFLECTION_CHECK_DELAYS_MS) {
+      setTimeout(() => {
+        checkValueReflectionTargets(sourceRow, sourceEl, observedAtMs, states, emittedTargets);
+      }, delayMs);
+    }
+  }
+
+  function sendInteractionRows(rows, sourceEl = null, beforeStates = null) {
+    const firstRow = Array.isArray(rows) ? rows[0] : null;
+    scheduleValueReflectionCheck(firstRow, sourceEl, beforeStates);
+    sendRows(rows);
+  }
+
   function isMenuElement(el) {
     if (!el) return false;
     if (el.tagName === 'A') return true;
@@ -718,6 +1345,142 @@
     const eventTsMs = Date.now();
     const before = takeDomSnapshot(el);
     setTimeout(()=>{ const after = takeDomSnapshot(el); try{ done({ dom_before: before, dom_after: after, eventTsMs }); }catch{}; }, SNAPSHOT.AFTER_DELAY_MS);
+  }
+
+  function businessTriggerType(el, label) {
+    const text = [
+      label,
+      visibleTextOf(el),
+      textOf(el),
+      el?.getAttribute?.('aria-label'),
+      el?.getAttribute?.('title'),
+      el?.value
+    ].filter(Boolean).join(' ');
+
+    if (!text) return null;
+    if (/삭제|Delete|Remove/i.test(text)) return 'delete';
+    if (/저장|등록|수정|확인|완료|전송|Save|Submit|Create|Update|Confirm|OK/i.test(text)) return 'save';
+    if (/조회|검색|Search|Find|Filter/i.test(text)) return 'search';
+    if (/취소|닫기|Cancel|Close/i.test(text)) return 'cancel';
+    if (/신규|추가|New|Add/i.test(text)) return 'new';
+    return null;
+  }
+
+  function structuredValueOf(el) {
+    if (!el || isSensitive(el)) return "*****";
+    const value = extractBestValue(el);
+    if (value === null || value === undefined) return null;
+    return clampText(maskValue(el, value), SNAPSHOT.STRUCTURED_MAX_VALUE_CHARS);
+  }
+
+  function collectStructuredFields(root) {
+    const nodes = Array.from(root.querySelectorAll('input, textarea, select, [contenteditable="true"]'));
+    return nodes.slice(0, SNAPSHOT.STRUCTURED_MAX_FIELDS).map((el) => {
+      const tag = (el.tagName || '').toLowerCase();
+      const type = (el.getAttribute?.('type') || '').toLowerCase();
+      if (type === 'hidden') return null;
+
+      const label =
+        associatedLabelOf(el) ||
+        el.getAttribute?.('aria-label') ||
+        el.getAttribute?.('placeholder') ||
+        el.getAttribute?.('name') ||
+        el.id ||
+        cssPath(el);
+
+      const value = structuredValueOf(el);
+      if (value === null || value === undefined || value === '') return null;
+
+      return {
+        label: clampText(label, 200),
+        value,
+        selector: cssPath(el),
+        tag,
+        type: type || null
+      };
+    }).filter(Boolean);
+  }
+
+  function collectStructuredGrids(root) {
+    const grids = Array.from(root.querySelectorAll('table, [role="grid"]')).slice(0, 5);
+    let usedCells = 0;
+
+    return grids.map((grid, gridIndex) => {
+      const headers = Array.from(grid.querySelectorAll('thead th, [role="columnheader"]'))
+        .map((h) => clampText(visibleTextOf(h) || textOf(h), 120))
+        .filter(Boolean);
+
+      const rows = Array.from(grid.querySelectorAll('tbody tr, [role="row"]'))
+        .slice(0, SNAPSHOT.STRUCTURED_MAX_GRID_ROWS)
+        .map((row) => {
+          const cells = Array.from(row.querySelectorAll('td, th, [role="cell"], [role="gridcell"]'));
+          const values = cells.map((cell, index) => {
+            if (usedCells >= SNAPSHOT.STRUCTURED_MAX_GRID_CELLS) return null;
+            usedCells += 1;
+
+            const label = headers[index] || `컬럼 ${index + 1}`;
+            const value = clampText(visibleTextOf(cell) || textOf(cell), SNAPSHOT.STRUCTURED_MAX_VALUE_CHARS);
+            if (!value) return null;
+            return { label, value };
+          }).filter(Boolean);
+
+          return values.length ? values : null;
+        }).filter(Boolean);
+
+      if (!rows.length) return null;
+      return {
+        grid_index: gridIndex,
+        selector: cssPath(grid),
+        headers,
+        rows
+      };
+    }).filter(Boolean);
+  }
+
+  function collectStructuredMessages(root) {
+    const nodes = Array.from(root.querySelectorAll(
+      '[role="alert"], .alert, .toast, .error, .invalid-feedback, .modal, .swal2-popup, .ant-message, .el-message'
+    ));
+
+    return nodes.slice(0, 20).map((node) => {
+      const message = clampText(visibleTextOf(node) || textOf(node), 500);
+      if (!message) return null;
+      return {
+        message,
+        selector: cssPath(node)
+      };
+    }).filter(Boolean);
+  }
+
+  function collectStructuredSnapshot(el, triggerType, triggerLabel, eventTsMs) {
+    if (!SNAPSHOT.STRUCTURED_ENABLED) return null;
+
+    const root = bestSnapshotRoot(el);
+    return {
+      kind: 'structured_snapshot',
+      version: 1,
+      source: 'chrome_collector',
+      captured_at: dtUtc9(eventTsMs || Date.now()),
+      trigger_type: triggerType,
+      trigger_label: triggerLabel || null,
+      page_url: location.href,
+      page_title: document.title || null,
+      snapshot: {
+        fields: collectStructuredFields(root),
+        grids: collectStructuredGrids(root),
+        messages: collectStructuredMessages(root)
+      }
+    };
+  }
+
+  function withStructuredSnapshot(el, triggerType, triggerLabel, done) {
+    withDomSnapshot(el, snap => {
+      const structured = collectStructuredSnapshot(el, triggerType, triggerLabel, snap.eventTsMs);
+      done({
+        ...snap,
+        api_response_body: structured
+      });
+    });
   }
 
   // ===== API 응답 body 캡처 (CSP-safe: background에서 MAIN world로 설치) =====
@@ -960,18 +1723,23 @@
   }
   function buildRow(el, logicalType, action, inputValue, extra={}) {
     const eventTsMs = Number.isFinite(extra?.eventTsMs) ? extra.eventTsMs : Number.isFinite(extra?.snapshot?.eventTsMs) ? extra.snapshot.eventTsMs : Date.now();
+    const eventId = crypto?.randomUUID?.() || (Date.now().toString(36) + Math.random().toString(36).slice(2));
     const menuRoot = logicalType === 'menu' ? navRootOf(el) : null;
     const menuTrail = logicalType === 'menu' ? liTrail(el, menuRoot) : null;
     const framePath = JSON.stringify(getFramePath(window));
+    const frameContext = buildFrameContext();
     const shadowPath = JSON.stringify(getShadowPath(el));
     const url = location.href;
 
     // element_text / associated_label (DB 컬럼: events.element_text / events.associated_label)
     const clickableBase = (el && el.closest) ? (el.closest(CLICKABLE_SELECTOR) || el) : el;
     const element_text = (clickableBase && isClickableElement(clickableBase)) ? visibleTextOf(clickableBase) : null;
-    const associated_label = (el && isInputLike(el)) ? associatedLabelOf(el) : null;
+    const labelTarget = resolveFrameworkField(el);
+    const associated_label = labelTarget ? associatedLabelOfAny(labelTarget) : null;
 
     const row = {
+      AZ_event_id: eventId,
+      AZ_interaction_id: `${PAGE_SESSION_ID}:${action || 'event'}:${eventTsMs}:${eventId.slice(0, 8)}`,
       AZ_event_time: dtUtc9(eventTsMs),
       AZ_event_ts_ms: eventTsMs,
       AZ_workflow_index: WORKFLOW_INDEX,
@@ -1022,6 +1790,7 @@
       AZ_form_name: formContext(el)?.name || null,
       AZ_form_action: formContext(el)?.action || null,
       AZ_frame_path: framePath,
+      AZ_frame_context: JSON.stringify(frameContext),
       AZ_shadow_path: shadowPath,
 
       // locators_json (object; server handles JSON or string)
@@ -1044,6 +1813,7 @@
           tab_id: TAB_ID,
           page_session_id: PAGE_SESSION_ID
         },
+        frame_context: frameContext,
         env: {
           os: navigator.platform || null,
           br: 'Chromium',
@@ -1078,19 +1848,20 @@
   // ───────────────── Handlers ─────────────────
   function onClick(e) {
     const el = (e.composedPath && e.composedPath()[0]) instanceof Element ? e.composedPath()[0] : (e.target instanceof Element ? e.target : null);
-    if (!el || isToggleInput(el)) return;
+    if (!el || isToggleInput(el) || isPlaceholderLike(el)) return;
 
-    let clickableBase = el.closest(CLICKABLE_SELECTOR)
+    let clickableBase = el.closest(CLICKABLE_SELECTOR) || resolveFrameworkField(el);
 
     // 비 표준 태그 버튼 처리
     if (!clickableBase) {
       const cls = (el.className || '').toString().toLowerCase();
       if (cls.includes('btn') || cls.includes('button')|| cls.includes('nav') || cls.includes('menu') || el.hasAttribute('tabindex')) {
-        clickableBase = el;
+        clickableBase = resolveFrameworkField(el) || el;
       }
     }
 
     if (!clickableBase) return; // 기능이 없는 요소 드랍
+    const reflectionBefore = snapshotValueReflectionTargets(clickableBase);
 
     // 드롭다운 메뉴 항목 클릭 시 즉시 텍스트 캡쳐
     // 드롭다운 메뉴 Selector 정의 (role 기반 포함)
@@ -1107,6 +1878,7 @@
     const menuItem = el.closest?.(MENU_SELECTOR);
     // 우선 순위: 보이는 텍스트(visibleTextOf)>기본 텍스트(textOf)>aria-label>title(attr 포함)>innerText
     if (menuItem) {
+      const menuReflectionBefore = snapshotValueReflectionTargets(menuItem);
       const itemText = (
         visibleTextOf(menuItem) ||
         textOf(menuItem) ||
@@ -1120,7 +1892,8 @@
         const row = buildRow(menuItem, 'menu', 'menu_click', itemText, { snapshot: snap });
         // buildRow가 element_text를 못 채운 케이스 대비
         if (!row.AZ_element_text) row.AZ_element_text = itemText;
-        sendRows([row]);
+        enrichFieldCommitRow(row, menuItem);
+        sendInteractionRows([row], menuItem, menuReflectionBefore);
       });
       return; // 드롭다운 항목은 여기서 종료(아래 로직 중복 기록 방지)
     }
@@ -1130,15 +1903,35 @@
     if (isMenu) {
       withDomSnapshot(clickableBase, snap => {
         const row = buildRow(clickableBase, 'menu', 'menu_click', textOf(clickableBase), { snapshot: snap });
-        sendRows([row]);
+        sendInteractionRows([row], clickableBase, reflectionBefore);
       });
     } else {
       const _t = (clickableBase.tagName || '').toLowerCase();
       if (_t === 'body' || _t === 'html') return;
-      const clickText = visibleTextOf(clickableBase) || textOf(clickableBase) || null;
-      const row = buildRow(clickableBase, 'event', 'click', null);
-      if (!row.AZ_element_text && clickText) row.AZ_element_text = clickText;
-      sendRows([row]);
+      const clickText =
+        visibleTextOf(clickableBase) ||
+        extractBestValue(clickableBase) ||
+        textOf(clickableBase) ||
+        null;
+      if (!isFieldCommitElement(clickableBase)) {
+        rememberFieldContext(clickableBase);
+      }
+      const triggerType = businessTriggerType(clickableBase, clickText);
+
+      if (triggerType) {
+        withStructuredSnapshot(clickableBase, triggerType, clickText, snap => {
+          const row = buildRow(clickableBase, 'event', 'click', null, { snapshot: snap });
+          if (!row.AZ_element_text && clickText) row.AZ_element_text = clickText;
+          enrichFieldCommitRow(row, clickableBase);
+          row.AZ_event_subtype = `business_${triggerType}`;
+          sendInteractionRows([row], clickableBase, reflectionBefore);
+        });
+      } else {
+        const row = buildRow(clickableBase, 'event', 'click', null);
+        if (!row.AZ_element_text && clickText) row.AZ_element_text = clickText;
+        enrichFieldCommitRow(row, clickableBase);
+        sendInteractionRows([row], clickableBase, reflectionBefore);
+      }
     }
   }
 
@@ -1149,6 +1942,7 @@
     if (!isInputLike(el)) return;
     if (isToggleInput(el)) return;
     if (isSensitive(el)) return;
+    rememberFieldContext(el);
     sendRows([buildRow(el, 'event', 'focus', null)]);
   }
 
@@ -1300,7 +2094,7 @@
     // 버튼 내부 자식(span, i) 텍스트 추출
     const submitterText = submitterBase ? visibleTextOf(submitterBase) : null;
     
-    withDomSnapshot(f, snap => {
+    withStructuredSnapshot(f, 'submit', submitterText, snap => {
       if (loginCandidate) commitLoginId(loginCandidate);
       const row = buildRow(f, 'event', 'submit', null, { snapshot: snap });
       // 텍스트 보강
@@ -1410,8 +2204,11 @@
   
     clearTimeout(FINAL_TIMERS.get(el));
     LAST_SENT.set(el, val);
+    rememberFieldContext(el);
   
     const row = buildRow(el, 'input', action, val); // withDomSnapshot 쓰지 않음
+    enrichFieldCommitRow(row, el);
+    rememberRecentValueEvent(el, action);
     sendRows([row]); // 즉시 전송
   }
 
@@ -1507,12 +2304,16 @@
     // focus 이벤트 (노이즈 고려)
     addEventListener('focus', onFocus, true);
     // addEventListener('blur', onBlur, true); // blur는 업무 의미보다 노이즈가 많아 기본 수집에서 제외
-    // addEventListener('input', onInput, true);
+    addEventListener('input', (e) => {
+      const el = e.target instanceof Element ? e.target : null;
+      if (el && isInputLike(el)) rememberRecentValueEvent(el, 'input');
+    }, true);
     addEventListener('change', (e) => {
       const el = e.target instanceof Element ? e.target : null;
       if (!el ||
           !isInputLike(el) ||
           isSensitive(el)) return;
+      rememberRecentValueEvent(el, 'change');
 
       const tag = (el.tagName || '').toLowerCase();
       const type = (el.getAttribute('type') || '').toLowerCase();
@@ -1524,9 +2325,12 @@
         if (val === null && val !== 0 && val !== false) return;
         if ((val ?? '') === (LAST_SENT.get(el) ?? '')) return;
         LAST_SENT.set(el, val);
+        rememberFieldContext(el);
         setTimeout(() => {
           withDomSnapshot(el, snap => {
-            sendRows([buildRow(el, 'input', 'change', val, { snapshot: snap })]); 
+            const row = buildRow(el, 'input', 'change', val, { snapshot: snap });
+            enrichFieldCommitRow(row, el);
+            sendRows([row]); 
           });
         }, 50); 
         return;
@@ -1548,8 +2352,11 @@
         if (!val && val !== 0 && val !== false) return;
         if ((val ?? '') === (LAST_SENT.get(el) ?? '')) return;
         LAST_SENT.set(el, val);
+        rememberFieldContext(el);
         withDomSnapshot(el, snap => {
-          sendRows([buildRow(el, 'input', 'change', val, { snapshot: snap })]);
+          const row = buildRow(el, 'input', 'change', val, { snapshot: snap });
+          enrichFieldCommitRow(row, el);
+          sendRows([row]);
         });
       }, 300));
     }, true);
