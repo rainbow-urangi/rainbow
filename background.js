@@ -1,1084 +1,1119 @@
-// background.js — Unified: 기존 CSV/디버그/변환 로직 유지 + rows 직행 업로드 + 재시도 큐 + 영속 브라우저 ID
-
-/***** 업로드/내보내기 설정 *****/
-// ⚠️ PROD INGEST
-const REALTIME_UPLOAD = true;
-const INGEST_URL = "https://rainbowlab.ai.kr/ingest/batch";
-const INGEST_API_KEY = "9F2A4C7D1E8B0FA3D6C4B1E7A9F03D2";
-
-/***** 업로드 큐/히스토리 *****/
-// CSV 내보내기용 히스토리(비우지 않음)
-const DB_BUFFER = [];
-// 서버 업로드용 큐(실패 시 재시도)
-const UPLOAD_QUEUE = [];
+const DEFAULT_INGEST_URL = "http://192.168.131.128:8080/ingest/batch";
+const DEFAULT_PROD_COLLECTOR_KEY = "test_key";
+const COLLECTOR_VERSION = chrome.runtime?.getManifest?.().version || "0.1.1";
+const QUEUE_KEY = "AZ_TEST_PENDING_ROWS";
+const COLLECTOR_INGEST_URL_KEY = "collectorIngestUrl";
+const TENANT_ID_KEY = "tenantId";
+const COLLECTOR_KEY_KEY = "collectorKey";
+const RUNTIME_CONFIG_URL_KEY = "collectorRuntimeConfigUrl";
+const RUNTIME_CONFIG_CACHE_KEY = "AZ_TEST_RUNTIME_CONFIG_CACHE";
+const DEFAULT_RUNTIME_CONFIG_TTL_MS = 5 * 60 * 1000;
+const QUEUE_FLUSH_ALARM_NAME = "AZ_TEST_QUEUE_FLUSH_WAKE";
+const QUEUE_FLUSH_ALARM_PERIOD_MINUTES = 1;
+const DEBUG_LOG_ALL_UPLOAD_PAYLOADS = true;
+const DEFAULT_API_CAPTURE_CONFIG = Object.freeze({
+  enabled: true,
+  transaction_mode: true,
+  emit_legacy_api_rows: false,
+  capture_request_body: false,
+  capture_response_body: false,
+  capture_headers: false,
+  allowed_header_names: [],
+  transaction_ttl_ms: 30000,
+  max_buffer_size: 500
+});
+const DEFAULT_RUNTIME_CONFIG = Object.freeze({
+  schema_version: 1,
+  version: "local-default",
+  source: "extension-default",
+  ttl_ms: DEFAULT_RUNTIME_CONFIG_TTL_MS,
+  modules: {},
+  event_types: {},
+  selector_packs: {},
+  workflow_rules: [],
+  privacy: {},
+  api_capture: DEFAULT_API_CAPTURE_CONFIG
+});
+const MAX_QUEUE_ROWS = 2000;
+const MAX_BATCH_ROWS = 100;
+const MAX_BATCH_BYTES = 256 * 1024;
+const BASE_UPLOAD_DELAY_MS = 800;
+const BASE_RETRY_DELAY_MS = 1000;
+const MAX_RETRY_DELAY_MS = 30000;
+const CONTENT_SCRIPT_MATCHERS = [
+  /^http:\/\/localhost:4175\//,
+  /^http:\/\/127\.0\.0\.1:4175\//,
+  /^http:\/\/localhost:4181\//,
+  /^http:\/\/127\.0\.0\.1:4181\//,
+  /^http:\/\/localhost:5173\/collector-test(?:[/?#]|$)/,
+  /^http:\/\/127\.0\.0\.1:5173\/collector-test(?:[/?#]|$)/,
+  /^https:\/\/example\.websquare\.kr\//,
+  /^https:\/\/demo\.tobesoft\.com\//,
+  /^https:\/\/c4web\.c4mix\.com\//,
+  /^https:\/\/rainbowlab\.ai\.kr\/rbem(?:[/?#]|$)/,
+  /^https:\/\/rainbowlab\.ai\.kr\/mypage(?:[/?#]|$)/
+];
 let uploadTimer = null;
 let uploadInFlight = false;
-let uploadQueueHydrated = false;
-const UPLOAD_INTERVAL_MS = 3000;
-const UPLOAD_QUEUE_KEY = "AZ_PENDING_UPLOAD_ROWS";
-const UPLOAD_QUEUE_WAKE_ALARM = "AZ_UPLOAD_QUEUE_WAKE";
-const UPLOAD_QUEUE_WAKE_PERIOD_MINUTES = 1;
+let hydrated = false;
+let flushRequestedWhileInFlight = false;
+let retryAttempt = 0;
+const pendingRows = [];
 
-async function hydrateUploadQueue() {
-  if (uploadQueueHydrated) return;
+function matchesCollectorTarget(url) {
+  return typeof url === "string" && CONTENT_SCRIPT_MATCHERS.some((pattern) => pattern.test(url));
+}
+
+function firstSourcePageUrl(rows) {
+  return Array.isArray(rows)
+    ? rows.find((row) => typeof row?.page_url === "string" && row.page_url.trim())?.page_url || null
+    : null;
+}
+
+function isProdCollectorUrl(url) {
+  if (typeof url !== "string") return false;
   try {
-    const got = await chrome.storage.local.get(UPLOAD_QUEUE_KEY);
-    const pending = Array.isArray(got?.[UPLOAD_QUEUE_KEY]) ? got[UPLOAD_QUEUE_KEY] : [];
-    if (pending.length) UPLOAD_QUEUE.push(...pending);
-  } catch (e) {
-    console.warn("[INGEST] queue hydrate failed", e);
-  } finally {
-    uploadQueueHydrated = true;
-  }
-}
-
-async function enqueueUploadRows(rows) {
-  if (!Array.isArray(rows) || !rows.length) return;
-  await hydrateUploadQueue();
-  UPLOAD_QUEUE.push(...rows);
-  await persistUploadQueue();
-}
-
-async function persistUploadQueue() {
-  try {
-    await chrome.storage.local.set({ [UPLOAD_QUEUE_KEY]: UPLOAD_QUEUE });
-  } catch (e) {
-    console.warn("[INGEST] queue persist failed", e);
-  }
-}
-
-void ensureUploadQueueWakeAlarm();
-void hydrateUploadQueue().then(() => {
-  if (UPLOAD_QUEUE.length) scheduleUpload();
-});
-
-// 탭 종료 상태 기록
-// GIT HISTORY NOTE (2ec7e8b -> 5918e02)
-// background.js는 초기에는 "업로드 큐 + API 메타 부착기"에 가까웠습니다.
-// 이후 커밋들에서 세 가지 축이 커졌습니다.
-// 1) 탭 전환/복귀 추적: tab resume 힌트를 content.js로 보내 page_view를 다시 발생시킴
-// 2) 종료 안정성: 마지막 row를 기억했다가 tab close 시 page_close row를 합성
-// 3) 잡음 제거: identity/value/text가 없는 change 이벤트를 버려 CSV/DB 오염을 줄임
-// 즉 이 파일의 역할이 "전송"에서 "세션/탭 경계 보정"까지 넓어졌습니다.
-const lastRowByTab = new Map();
-
-const pendingNavClickByTab = new Map();
-let lastActiveTabId = null;
-
-function notifyResumeToTab(tabId, reason) {
-  if (typeof tabId !== "number" || tabId < 0) return;
-
-  chrome.tabs.sendMessage(
-    tabId,
-    { type: "AZ_PAGE_RESUME_HINT", reason, ts: Date.now(), tab_changed: true },
-    () => { void chrome.runtime.lastError; }
-  );
-}
-
-function handleActiveTabChanged(tabId, reason) {
-  if (typeof tabId !== "number" || tabId < 0) return;
-  if (lastActiveTabId === tabId) return; // tab_id 안 바뀌면 발행 안 함
-
-  lastActiveTabId = tabId;
-  notifyResumeToTab(tabId, reason);
-}
-
-chrome.tabs.onActivated.addListener(({ tabId }) => {
-  handleActiveTabChanged(tabId, "tabs.onActivated");
-});
-
-chrome.windows.onFocusChanged.addListener((windowId) => {
-  if (windowId === chrome.windows.WINDOW_ID_NONE) return;
-
-  chrome.tabs.query({ active: true, windowId }, (tabs) => {
-    const tabId = tabs?.[0]?.id;
-    handleActiveTabChanged(tabId, "windows.onFocusChanged");
-  });
-});
-
-// 초기 기준값만 세팅
-chrome.tabs.query({ active: true, lastFocusedWindow: true }, (tabs) => {
-  lastActiveTabId = tabs?.[0]?.id ?? null;
-});
-
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  const tabId = sender?.tab?.id;
-  if (!tabId) return;
-
-  if (msg?.type === 'NAV_CLICK_STORE') {
-    pendingNavClickByTab.set(tabId, msg.payload);
-    sendResponse({ ok: true });
-    return true;
-  }
-
-  if (msg?.type === 'NAV_CLICK_POP') {
-    const payload = pendingNavClickByTab.get(tabId) || null;
-    pendingNavClickByTab.delete(tabId);
-    sendResponse({ ok: true, payload });
-    return true;
-  }
-});
-
-/***** 유틸 *****/
-/*
-CHANGE NOTE: code_after 의 dt0()는 UTC 초 단위 문자열만 만들었습니다.
-
-LEGACY_FROM_code_after:
-function dt0(ms) {
-  const d = new Date(ms || Date.now());
-  return (
-    d.getUTCFullYear() + "-" +
-    pad(d.getUTCMonth() + 1) + "-" +
-    pad(d.getUTCDate()) + " " +
-    pad(d.getUTCHours()) + ":" +
-    pad(d.getUTCMinutes()) + ":" +
-    pad(d.getUTCSeconds())
-  );
-}
-
-현재는 KST(+09:00) 기준 + ms까지 포함합니다.
-*/
-const pad = (n, z = 2) => String(n).padStart(z, "0");
-function dt0(ms) {
-  const d = new Date(ms || Date.now());
-  const utc9 = new Date(d.getTime() + (9 * 60 * 60 * 1000));
-  return (
-    utc9.getUTCFullYear() + "-" +
-    pad(utc9.getUTCMonth() + 1) + "-" +
-    pad(utc9.getUTCDate()) + " " +
-    pad(utc9.getUTCHours()) + ":" +
-    pad(utc9.getUTCMinutes()) + ":" +
-    pad(utc9.getUTCSeconds()) + "." +
-    pad(utc9.getUTCMilliseconds(), 3)
-  );
-}
-function csvEscape(v) {
-  if (v == null) return "";
-  const s = typeof v === "string" ? v : JSON.stringify(v);
-  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
-}
-function tsFile() {
-  const d = new Date();
-  return (
-    d.getFullYear() +
-    pad(d.getMonth() + 1) +
-    pad(d.getDate()) + "_" +
-    pad(d.getHours()) +
-    pad(d.getMinutes()) +
-    pad(d.getSeconds())
-  );
-}
-function downloadText(filename, text, mime = "text/csv") {
-  const url = "data:" + mime + ";charset=utf-8," + encodeURIComponent("\ufeff" + text);
-  chrome.downloads.download({ url, filename, saveAs: false }, () => {
-    if (chrome.runtime.lastError) {
-      console.error("[DOWNLOAD]", chrome.runtime.lastError.message);
-    }
-  });
-}
-function sameHost(u1, u2) {
-  try {
-    return new URL(u1).host === new URL(u2).host;
+    const parsed = new URL(url);
+    return parsed.hostname === "rainbowlab.ai.kr" || parsed.hostname === "192.168.131.128";
   } catch {
-    // 원래 코드와 비슷하게: 파싱 실패 시 "같다" 가정해서 메타를 붙여줌
-    return true;
+    return false;
   }
 }
-function urlPath(u) {
-  try { return new URL(u).pathname; } catch { return null; }
-}
-function urlHost(u) {
-  try { return new URL(u).host; } catch { return null; }
-}
-function pickTestId(obj) {
-  if (!obj) return null;
-  return (
-    obj["data-testid"] ||
-    obj["data-test-id"] ||
-    obj["data-qa"] ||
-    obj["data-cy"] ||
-    null
-  );
-}
-function isSensitiveAttr(attrs) {
-  const t = (attrs?.type || "").toLowerCase();
-  const n = (attrs?.name || "").toLowerCase();
-  return t === "password" || /pass|pwd|ssn|credit|주민|비번/i.test(n);
-}
-const ALLOWED_KEYS = new Set([
-  "Enter","Tab","Escape","Backspace","Delete",
-  "ArrowLeft","ArrowRight","ArrowUp","ArrowDown",
-  "Home","End","PageUp","PageDown"
-]);
-function isNoiseChangeRow(r) {
-  const action = (r?.AZ_event_action || "").toLowerCase();
-  const hasIdentity = !!(r?.AZ_element_uid || r?.AZ_selector_css || r?.AZ_selector_xpath || r?.AZ_element_tag);
-  const hasValue = !(r?.AZ_data === null || r?.AZ_data === undefined || r?.AZ_data === "");
-  const hasText = !!(r?.AZ_element_text || r?.AZ_associated_label);
 
-  // action이 비었거나 change인데, 식별/값/텍스트가 전부 없으면 노이즈
-  return (!action || action === "change") && !hasIdentity && !hasValue && !hasText;
+function isC4WebPageUrl(url) {
+  return typeof url === "string" && /^https:\/\/c4web\.c4mix\.com(?:[/?#]|$)/.test(url);
 }
 
-/***** 브라우저 세션 ID (영속) *****/
-const BROWSER_KEY = "AZ_BROWSER_ID";
-let BROWSER_SESSION_ID = null;
+function padDatePart(value, width = 2) {
+  return String(value).padStart(width, "0");
+}
 
-(async () => {
+function toCollectorDateTime(value) {
+  const parsed = new Date(value);
+  const date = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+  return [
+    `${date.getUTCFullYear()}-${padDatePart(date.getUTCMonth() + 1)}-${padDatePart(date.getUTCDate())}`,
+    `${padDatePart(date.getUTCHours())}:${padDatePart(date.getUTCMinutes())}:${padDatePart(date.getUTCSeconds())}.${padDatePart(date.getUTCMilliseconds(), 3)}`
+  ].join(" ");
+}
+
+function toEventTimestampMs(value) {
+  const parsed = new Date(value);
+  const timeMs = parsed.getTime();
+  return Number.isFinite(timeMs) ? timeMs : Date.now();
+}
+
+function toJsonSafeObject(value) {
+  if (!value || typeof value !== "object") return null;
   try {
-    const got = await chrome.storage.local.get(BROWSER_KEY);
-    if (got && got[BROWSER_KEY]) {
-      BROWSER_SESSION_ID = got[BROWSER_KEY];
-    } else {
-      BROWSER_SESSION_ID =
-        crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
-      await chrome.storage.local.set({ [BROWSER_KEY]: BROWSER_SESSION_ID });
-    }
-  } catch (e) {
-    console.warn("[AZ] browser id init failed", e);
-    BROWSER_SESSION_ID =
-      crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).slice(2);
+    return JSON.parse(JSON.stringify(value));
+  } catch {
+    return null;
   }
-})();
-
-/***** HELLO 핸드셰이크 (구/신 content.js 모두 호환) *****/
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg?.type === "HELLO") {
-    const ack = {
-      browser_session_id: BROWSER_SESSION_ID,
-      tab_id: sender?.tab?.id ?? null
-    };
-    // 구버전과 신버전 둘 다 이해할 수 있게 평문 + 래핑 둘 다 전달
-    sendResponse?.({
-      ok: true,
-      type: "HELLO_ACK",
-      payload: ack,
-      ...ack
-    });
-    return true;
-  }
-  return false;
-});
-
-/***** API 매핑(지연 포함) *****/
-// const lastApiByTab = new Map(); // tabId -> { url, method, status, startTs, endTs, latencyMs }
-// const bucket = lastApiByTab.get(tabId) || [];
-// bucket.push({ url, method, status, startTs, endTs, latencyMs });
-// lastApiByTab.set(tabId, bucket.slice(-10));
-const lastApiByTab = new Map(); // tabId -> [{ requestId, url, method, status, startTs, endTs, latencyMs }]
-
-function upsertApiMeta(tabId, requestId, patch) {
-  if (tabId < 0 || !requestId) return;
-  const bucket = lastApiByTab.get(tabId) || [];
-  const idx = bucket.findIndex((item) => item.requestId === requestId);
-  const prev = idx >= 0 ? bucket[idx] : {};
-  const next = { ...prev, ...patch, requestId };
-  if (idx >= 0) bucket[idx] = next;
-  else bucket.push(next);
-  lastApiByTab.set(tabId, bucket.slice(-10));
 }
 
-function getApiMeta(tabId, requestId) {
-  const bucket = lastApiByTab.get(tabId) || [];
-  return bucket.find((item) => item.requestId === requestId) || {};
-}
-
-function pickLatestApiMeta(tabId, pageUrl) {
-  const bucket = lastApiByTab.get(tabId) || [];
-  if (!bucket.length) return {};
-  const sameHostItems = bucket.filter((item) => item.url && sameHost(item.url, pageUrl));
-  const candidates = sameHostItems.length ? sameHostItems : bucket;
-  return candidates
-    .slice()
-    .sort((a, b) => (b.endTs ?? b.startTs ?? 0) - (a.endTs ?? a.startTs ?? 0))[0] || {};
-}
-
-chrome.webRequest.onBeforeRequest.addListener(
-  (details) => {
-    if (
-      details.tabId >= 0 &&
-      ["xmlhttprequest", "fetch", "beacon", "ping", "main_frame"].includes(details.type)
-    ) {
-      upsertApiMeta(details.tabId, details.requestId, {
-        url: details.url,
-        method: details.method,
-        status: null,
-        startTs: details.timeStamp,
-        endTs: null,
-        latencyMs: null
-      });
-      // try {
-      //   chrome.tabs.sendMessage(details.tabId, { type: "FLUSH_REQUEST" });
-      // } catch (e) {
-      //   // content 쪽이 없을 수도 있으니 무시
-      // }
-    }
-  },
-  { urls: ["<all_urls>"] }
-);
-
-/*
-CHANGE NOTE: code_after 는 tabId >= 0 인 요청을 넓게 모두 받았습니다.
-
-LEGACY_FROM_code_after:
-if (details.tabId >= 0) {
-  ...
-}
-
-현재는 xmlhttprequest/fetch/beacon/ping/main_frame 로 제한합니다.
-변경 이유:
-- 정적 리소스까지 API 메타로 붙는 잡음 감소
-- 업무 의미가 있는 네트워크 이벤트만 남기기 위함
-*/
-chrome.webRequest.onCompleted.addListener(
-  (details) => {
-    if (
-      details.tabId >= 0 &&
-      ["xmlhttprequest", "fetch", "beacon", "ping", "main_frame"].includes(details.type)
-    ) {
-      const prev = getApiMeta(details.tabId, details.requestId);
-      const startTs = prev.startTs ?? details.timeStamp;
-      const endTs = details.timeStamp;
-      upsertApiMeta(details.tabId, details.requestId, {
-        url: details.url,
-        method: details.method,
-        status: details.statusCode,
-        startTs,
-        endTs,
-        latencyMs: Math.max(0, Math.round(endTs - startTs))
-      });
-    }
-  },
-  { urls: ["<all_urls>"] }
-);
-
-chrome.webRequest.onErrorOccurred?.addListener(
-  (details) => {
-    if (
-      details.tabId >= 0 &&
-      ["xmlhttprequest", "fetch", "beacon", "ping", "main_frame"].includes(details.type)
-    ) {
-      const prev = getApiMeta(details.tabId, details.requestId);
-      const startTs = prev.startTs ?? details.timeStamp;
-      const endTs = details.timeStamp;
-      upsertApiMeta(details.tabId, details.requestId, {
-        url: details.url,
-        method: details.method,
-        status: -1,
-        startTs,
-        endTs,
-        latencyMs: Math.max(0, Math.round(endTs - startTs))
-      });
-    }
-  },
-  { urls: ["<all_urls>"] }
-);
-
-/***** 업로드(내부 큐 + 재시도) *****/
-function scheduleUpload() {
-  if (uploadTimer) return;
-  uploadTimer = setTimeout(flushUpload, UPLOAD_INTERVAL_MS);
-}
-
-async function ensureUploadQueueWakeAlarm() {
-  if (!chrome.alarms?.create) return;
+function toJsonSafeString(value) {
+  if (value == null) return null;
+  if (typeof value === "string") return value;
   try {
-    await chrome.alarms.create(UPLOAD_QUEUE_WAKE_ALARM, {
-      periodInMinutes: UPLOAD_QUEUE_WAKE_PERIOD_MINUTES
-    });
-  } catch (e) {
-    console.warn("[INGEST] queue wake alarm setup failed", e);
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
   }
 }
 
-async function wakeUploadQueue(reason = "alarm") {
-  await hydrateUploadQueue();
-  if (!UPLOAD_QUEUE.length) return;
-  console.info("[INGEST] queue wake flush", { reason, pendingRows: UPLOAD_QUEUE.length });
-  scheduleUpload();
-}
-
-if (chrome.alarms?.onAlarm) {
-  chrome.alarms.onAlarm.addListener((alarm) => {
-    if (alarm?.name !== UPLOAD_QUEUE_WAKE_ALARM) return;
-    void wakeUploadQueue("alarm");
-  });
-}
-
-chrome.runtime.onInstalled?.addListener(() => {
-  void ensureUploadQueueWakeAlarm();
-  void wakeUploadQueue("runtime_installed");
-});
-
-chrome.runtime.onStartup?.addListener(() => {
-  void ensureUploadQueueWakeAlarm();
-  void wakeUploadQueue("runtime_startup");
-});
-
-/*
-CHANGE NOTE: code_after 의 flushUpload 는 단순 업로드 함수였습니다.
-현재는 종료 시 keepalive 전송을 의도하는 isFinal 인자를 받습니다.
-
-LEGACY_FROM_code_after:
-async function flushUpload() {
-  uploadTimer = null;
-  if (!UPLOAD_QUEUE.length) return;
-
-  const rows = UPLOAD_QUEUE.splice(0, UPLOAD_QUEUE.length);
+function toUrlPath(value) {
+  if (typeof value !== "string" || !value.trim()) return null;
   try {
-    const body = JSON.stringify({ rows, ts: Date.now() });
-    const headers = { "Content-Type": "application/json" };
-    if (INGEST_API_KEY) headers["x-api-key"] = INGEST_API_KEY;
-
-    const res = await fetch(INGEST_URL, { method: "POST", headers, body });
-    if (!res.ok) {
-      const t = await res.text().catch(() => "");
-      console.warn("[INGEST] non-200", res.status, t);
-      throw new Error(String(res.status));
-    }
-  } catch (e) {
-    console.warn("[INGEST] failed, re-queue", e);
-    UPLOAD_QUEUE.unshift(...rows);
-    scheduleUpload();
+    return new URL(value).pathname || "/";
+  } catch {
+    return null;
   }
 }
 
-현재 추가 의도:
-- 창 종료 전 마지막 배치 손실 감소
-- page_close 합성 row 와 결합해 종료 이벤트 보존
-
-주의:
-- 현재 코드에서는 options.keepalive 를 만들지만 fetch 호출엔 직접 쓰지 않습니다.
-- 즉 "의도는 keepalive"지만 실제 적용 여부는 별도 확인이 필요합니다.
-*/
-/*
-LEGACY_FROM_2ec7e8b: duplicate-upload reproduction helper
-초기에는 업로드 타이밍 문제를 강제로 재현하려고 5초 abort 실험 코드가 있었습니다.
-운영 코드로는 부적절해서 제거됐고, 지금은 종료 시 keepalive 의도가 추가됐습니다.
-
-    // const FETCH_TIMEOUT_MS = 5000; // [재현용] 5초
-    // const ac = new AbortController();
-    // const tid = setTimeout(() => ac.abort(), FETCH_TIMEOUT_MS);
-    // let res;
-    // try {
-    //   res = await fetch(INGEST_URL, { method: "POST", headers, body, signal: ac.signal });
-    // } finally {
-    //   clearTimeout(tid);
-    // }
-
-주의:
-- 이 코드를 다시 활성화하면 정상 실패와 인위적 실패가 섞여 retry 해석이 왜곡됩니다.
-- keepalive 추가 의도는 "창 종료 전 마지막 배치 손실 감소"입니다.
-*/
-async function flushUpload(isFinal = false) {
-  await hydrateUploadQueue();
-  uploadTimer = null;
-  if (uploadInFlight || !UPLOAD_QUEUE.length) return;
-
-  uploadInFlight = true;
-  const rows = UPLOAD_QUEUE.slice();
-  try {
-    const body = JSON.stringify({ rows, ts: Date.now() });
-    const headers = { "Content-Type": "application/json" };
-    if (INGEST_API_KEY) headers["x-api-key"] = INGEST_API_KEY;
-
-    // 창 종료 시 OS에 전송을 위임하기 위해 keepalive 옵션 추가
-    const options = { method: "POST", headers, body };
-    if (isFinal) options.keepalive = true;
-    const res = await fetch(INGEST_URL, options);
-    if (!res.ok) {
-      const t = await res.text().catch(() => "");
-      console.warn("[INGEST] non-200", res.status, t);
-      throw new Error(String(res.status));
-    }
-    UPLOAD_QUEUE.splice(0, rows.length);
-    await persistUploadQueue();
-  } catch (e) {
-    console.warn("[INGEST] failed, re-queue", e);
-    scheduleUpload();
-  } finally {
-    uploadInFlight = false;
-  }
-}
-function realtimeUpload(rows, reason) {
-  if (!REALTIME_UPLOAD || !Array.isArray(rows) || !rows.length) return;
-  void enqueueUploadRows(rows).then(() => {
-    if (uploadInFlight) scheduleUpload();
-    else void flushUpload();
-  }).catch((e) => {
-    console.warn("[INGEST] enqueue failed", e);
-  });
-}
-
-/***** 콘솔 로깅 + 히스토리(DB_BUFFER) 보존 *****/
-function logAndBuffer(reason, rows) {
-  if (!rows || !rows.length) return;
-  console.group(`[DB ROWS] reason=${reason} count=${rows.length}`);
-  try {
-    console.table(rows, [
-      "AZ_event_action","AZ_event_subtype","AZ_url","AZ_url_host","AZ_url_path",
-      "AZ_element_type","AZ_element_uid","AZ_element_label","AZ_element_text","AZ_associated_label",
-      "AZ_api_method","AZ_api_status","AZ_api_path","AZ_api_latency_ms",
-      "AZ_login_id","AZ_event_time"
-    ]);
-  } catch (e) {
-    console.warn("[DB ROWS] console.table failed", e);
-  } finally {
-    console.groupEnd();
-  }
-  DB_BUFFER.push(...rows);      // CSV용으로 계속 누적
-  realtimeUpload(rows, reason); // 서버 업로드 큐로 전달
-}
-
-/***** CSV 헤더(확장) — 원본과 동일 구성 *****/
-const CSV_HEADERS = [
-  // 기존 19개
-  "AZ_api_url","AZ_api_method","AZ_api_status","AZ_api_path",
-  "AZ_ip_address","AZ_url","AZ_login_id","AZ_event_time",
-  "AZ_element_uid","AZ_element_type","AZ_element_label","AZ_element_text","AZ_associated_label","AZ_data",
-  "AZ_frame_path","AZ_shadow_path","AZ_form_selector",
-  "AZ_locators_json","AZ_nav_root","AZ_menu_li_trail","AZ_post_hints",
-  // 확장 메타
-  "AZ_event_action","AZ_event_subtype",
-  "AZ_page_title","AZ_referrer","AZ_viewport_w","AZ_viewport_h",
-  "AZ_url_host","AZ_url_path",
-  "AZ_api_host","AZ_api_latency_ms",
-  "AZ_session_install_id","AZ_session_browser_id","AZ_session_tab_id","AZ_session_page_id",
-  "AZ_selector_css","AZ_selector_xpath","AZ_element_tag",
-  "AZ_a11y_role","AZ_aria_label","AZ_aria_labelledby",
-  "AZ_form_name","AZ_form_action","AZ_data_testid","AZ_input_length","AZ_is_sensitive",
-  "AZ_key","AZ_key_mods",
-  "AZ_menu_section","AZ_menu_item",
-  "AZ_route_from","AZ_route_to",
-  // (신규) 스냅샷
-  "AZ_dom_before","AZ_dom_after","AZ_api_response_body"
-];
-
-function exportDbCsv() {
-  const lines = [CSV_HEADERS.join(",")];
-  for (const r of DB_BUFFER) {
-    lines.push(CSV_HEADERS.map((h) => csvEscape(r[h])).join(","));
-  }
-  downloadText(`az_db_rows_${tsFile()}.csv`, lines.join("\n"));
-}
-function safeExportAllCsv() {
-  try {
-    if (!DB_BUFFER.length) {
-      downloadText(
-        `az_readme_${tsFile()}.txt`,
-        "No logs yet. Interact, then export.",
-        "text/plain"
-      );
-      return;
-    }
-    exportDbCsv();
-  } catch (e) {
-    console.error("[EXPORT] failed", e);
-  }
-}
-chrome.action.onClicked.addListener(() => safeExportAllCsv());
-chrome.commands.onCommand.addListener((cmd) => {
-  if (cmd === "export-csv") safeExportAllCsv();
-});
-
-/***** 공통 변환 (payload.events → AZ_* 행 생성, 구 content.js 호환) *****/
-function attachApi(url, tabId) {
-  const api = pickLatestApiMeta(tabId, url);
-  const same = api.url && sameHost(api.url, url);
-  return {
-    AZ_api_url: same ? api.url : null,
-    AZ_api_method: api.method || null,
-    AZ_api_status: api.status ?? null,
-    AZ_api_path: same && api.url ? urlPath(api.url) : null,
-    AZ_api_host: same && api.url ? urlHost(api.url) : null,
-    AZ_api_latency_ms: same ? (api.latencyMs ?? null) : null
-  };
-}
-
-function baseCommon(ev, tabId, loginId) {
-  const d = ev.data || {};
-  const url = ev.url || "";
-  const ts = ev.timestamp || Date.now();
-  const sess = d.meta?.session || {};
-  return {
-    AZ_ip_address: null, // 확장에서는 얻을 수 없음(서버에서 보강)
-    AZ_url: url,
-    AZ_url_host: urlHost(url),
-    AZ_url_path: urlPath(url),
-    AZ_login_id: loginId,
-    AZ_event_time: dt0(ts),
-    AZ_selector_css: ev.selector?.css || null,
-    AZ_selector_xpath: ev.selector?.xpath || null,
-    AZ_element_tag: (ev.tagName || "").toUpperCase() || null,
-    AZ_frame_path: JSON.stringify(d.framePath || []),
-    AZ_shadow_path: JSON.stringify(d.shadowPath || []),
-    AZ_form_selector: d.form ? d.form.selector || null : null,
-    AZ_form_name: d.form ? d.form.name || null : null,
-    AZ_form_action: d.form ? d.form.action || null : null,
-    AZ_a11y_role: d.a11y?.role ?? d.role ?? null,
-    AZ_aria_label: d.a11y?.ariaLabel ?? null,
-    AZ_aria_labelledby: d.a11y?.ariaLabelledby ?? null,
-    AZ_session_install_id: sess.install_id || null,
-    AZ_session_browser_id: sess.browser_session_id || null,
-    AZ_session_tab_id: sess.tab_id ?? null,
-    AZ_session_page_id: sess.page_session_id || null,
-    AZ_data_testid: pickTestId(d.testids || d.dataset),
-    AZ_locators_json: JSON.stringify({
-      a11y: d.a11y || null,
-      testids: d.testids || d.dataset || null,
-      attrs: d.attributes || null,
-      bounds: d.bounds || null,
-      session: d.meta?.session || null,
-      env: d.meta?.env || null
-    }),
-    // snapshot pass-through
-    AZ_dom_before: d.snapshot?.dom_before ?? null,
-    AZ_dom_after: d.snapshot?.dom_after ?? null,
-    AZ_api_response_body: d.snapshot?.api_response_body ?? null
-  };
-}
-
-function eventToDbRow(ev, tabId, loginId = "unknown") {
-  const a = ev.action;
-  const t = (ev.tagName || "").toUpperCase();
-  const d = ev.data || {};
-  const url = ev.url || "";
-
-  const base = {
-    ...baseCommon(ev, tabId, loginId),
-    ...attachApi(url, tabId),
-    AZ_element_uid:
-      (d.identifier || ev.selector?.css || ev.selector?.xpath || "")
-        .toString()
-        .slice(0, 256),
-    AZ_element_type: null,
-    AZ_element_label: null,
-    AZ_data: null,
-    AZ_nav_root: d.navRoot || null,
-    AZ_menu_li_trail: null,
-    AZ_post_hints: null,
-    AZ_event_action: a || null,
-    AZ_event_subtype: null,
-    AZ_page_title: null,
-    AZ_referrer: null,
-    AZ_viewport_w: null,
-    AZ_viewport_h: null,
-    AZ_input_length: null,
-    AZ_is_sensitive: null,
-    AZ_key: null,
-    AZ_key_mods: null,
-    AZ_menu_section: null,
-    AZ_menu_item: null,
-    AZ_route_from: null,
-    AZ_route_to: null
-  };
-
-  // 메뉴 클릭
-  if (a === "menu_click") {
-    const label = d.label || null;
-    const liTrail = Array.isArray(d.liTrail) ? d.liTrail : [];
-    const section = liTrail.slice(-1)[0] || label || null;
-    const item = label && section && !section.includes(label) ? label : null;
-
-    return {
-      ...base,
-      AZ_element_type: "menu",
-      AZ_element_label: label,
-      AZ_data: [
-        d.href ? `href=${d.href}` : null,
-        liTrail.length ? `trail=${liTrail.join(" > ")}` : null,
-        d.role ? `role=${d.role}` : null
-      ]
-        .filter(Boolean)
-        .join(" | ")
-        .slice(0, 1000),
-      AZ_menu_li_trail: liTrail.length ? JSON.stringify(liTrail) : null,
-      AZ_menu_section: section || null,
-      AZ_menu_item: item || null,
-      AZ_page_title: d.title || null
-    };
-  }
-
-  // 페이지 뷰
-  if (a === "page_view") {
-    const vp = d.viewport || {};
-    const sess = d.meta?.session || {};
-    return {
-      ...base,
-      AZ_element_uid: "PAGE",
-      AZ_element_type: "page",
-      AZ_page_title: d.title || null,
-      AZ_referrer: d.referrer || null,
-      AZ_viewport_w: vp.w ?? null,
-      AZ_viewport_h: vp.h ?? null,
-      AZ_session_install_id: sess.install_id || base.AZ_session_install_id,
-      AZ_session_browser_id: sess.browser_session_id || base.AZ_session_browser_id,
-      AZ_session_tab_id: sess.tab_id ?? base.AZ_session_tab_id,
-      AZ_session_page_id: sess.page_session_id || base.AZ_session_page_id
-    };
-  }
-
-  // 라우팅
-  if (a === "route_change") {
-    return {
-      ...base,
-      AZ_element_uid: "ROUTE",
-      AZ_element_type: "route",
-      AZ_event_subtype: "spa",
-      AZ_page_title: d.title || null,
-      AZ_route_from: d.from || null,
-      AZ_route_to: d.to || null
-    };
-  }
-
-  // form submit (스냅샷 포함)
-  if (a === "submit") {
-    return {
-      ...base,
-      AZ_element_type: "event",
-      AZ_event_subtype: "submit"
-    };
-  }
-
-  // 입력/확정값
+function inferElementType(action, payload) {
+  if (action === "page_view") return "page";
+  if (action === "ui_outcome") return "state";
   if (
-    (["INPUT", "TEXTAREA", "SELECT"].includes(t) && ["input", "change"].includes(a)) ||
-    a === "change"
+    action === "api_transaction" ||
+    action === "api_transaction_error" ||
+    action === "api_transaction_timeout" ||
+    action === "route_change" ||
+    action === "screen_change" ||
+    action === "collector_boot" ||
+    action === "page_close" ||
+    action === "submit"
+  ) return "event";
+  if (payload?.api_context) return "event";
+  if (action === "menu_click") return "menu";
+  if (
+    action === "click" &&
+    payload?.menu_context &&
+    payload.menu_context.source !== "url" &&
+    !payload.menu_context.warnings?.includes?.("url_fallback")
+  ) return "menu";
+  return null;
+}
+
+function extractInputData(payload, row, action) {
+  const inputContext = payload?.input_context && typeof payload.input_context === "object"
+    ? payload.input_context
+    : null;
+
+  if (inputContext?.value != null) return toJsonSafeString(inputContext.value);
+  if (inputContext?.data != null) return toJsonSafeString(inputContext.data);
+  if (inputContext?.pasted_text != null) return toJsonSafeString(inputContext.pasted_text);
+  if (payload?.value != null) return toJsonSafeString(payload.value);
+  if (payload?.data != null) return toJsonSafeString(payload.data);
+
+  if (
+    typeof row?.element_text === "string" &&
+    ["input", "change", "beforeinput", "compositionend", "paste"].includes(String(action || ""))
   ) {
-    const type = (d.attributes?.type || d.inputType || t.toLowerCase() || "")
-      .slice(0, 32);
-    const value = d.value === undefined ? null : d.value;
-    const sens = isSensitiveAttr(d.attributes);
-
-    return {
-      ...base,
-      AZ_element_type: type,
-      AZ_element_label: d.label ?? null,
-      AZ_data: value,
-      AZ_input_length: typeof value === "string" ? value.length : null,
-      AZ_is_sensitive: sens ? 1 : 0
-    };
-  }
-
-  // 전량 이벤트 (키입력 등)
-  if (a === "event") {
-    const payload = d.instant || {};
-    let key = null;
-    let mods = null;
-    const subtype = payload.type || null;
-    let inputLen = null;
-
-    if (subtype === "keydown" || subtype === "keyup") {
-      if (ALLOWED_KEYS.has(payload.key)) {
-        key = payload.key;
-      }
-      const m = [];
-      if (payload.ctrl) m.push("ctrl");
-      if (payload.alt) m.push("alt");
-      if (payload.shift) m.push("shift");
-      mods = m.length ? m.join("+") : null;
-    }
-    if (subtype === "input") {
-      inputLen = typeof payload.length === "number" ? payload.length : null;
-    }
-
-    return {
-      ...base,
-      AZ_element_type: "event",
-      AZ_event_subtype: subtype,
-      AZ_key: key,
-      AZ_key_mods: mods,
-      AZ_input_length: inputLen,
-      AZ_data: payload ? JSON.stringify(payload) : null,
-    };
+    return row.element_text;
   }
 
   return null;
 }
 
-/***** 메시지 수신 — rows(신) & payload.events(구) 모두 지원 *****/
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  // ✅ 이 타입이 아니면 포트를 열지 않음
-  if (msg?.type !== "BATCH_EVENTS") return;
+function normalizeRowForCollector(row, ingestUrl) {
+  if (!isProdCollectorUrl(ingestUrl)) return row;
+  if (!row || typeof row !== "object") return row;
+  if (Object.prototype.hasOwnProperty.call(row, "AZ_event_time")) return row;
 
-  (async () => {
-    try {
-      const tabId = sender?.tab?.id ?? -1;
-      const reason = msg.payload?.reason || msg.reason || "";
+  const payload = row.payload && typeof row.payload === "object" ? row.payload : {};
+  const pageContext =
+    payload.page_context && typeof payload.page_context === "object" ? payload.page_context : {};
+  const elementContext =
+    payload.element_context && typeof payload.element_context === "object" ? payload.element_context : {};
+  const apiContext =
+    payload.api_context && typeof payload.api_context === "object" ? payload.api_context : {};
+  const relationContext =
+    payload.relation_context && typeof payload.relation_context === "object" ? payload.relation_context : null;
+  const inputContext =
+    payload.input_context && typeof payload.input_context === "object" ? payload.input_context : {};
+  const menuContext =
+    payload.menu_context && typeof payload.menu_context === "object" ? payload.menu_context : null;
+  const uiOutcome =
+    payload.ui_outcome && typeof payload.ui_outcome === "object" ? payload.ui_outcome : null;
 
-      // 1) 새 포맷: rows (content.js에서 AZ_* 필드 직접 생성)
-      if (Array.isArray(msg.rows)) {
-        const rows = msg.rows.map((r0) => {
-          const r = { ...r0 };
+  const action = typeof row.action === "string" && row.action.trim() ? row.action.trim() : "change";
+  const eventTime = toCollectorDateTime(row.event_time);
+  const pageUrl =
+    typeof row.page_url === "string" && row.page_url.trim()
+      ? row.page_url
+      : (typeof pageContext.page_url === "string" ? pageContext.page_url : null);
+  const pageSessionId =
+    typeof row.page_session_id === "string" && row.page_session_id.trim()
+      ? row.page_session_id
+      : (typeof pageContext.page_session_id === "string" ? pageContext.page_session_id : null);
+  const loginId = pageSessionId ? `session:${pageSessionId}` : `collector:${row.event_id || Date.now()}`;
+  const inputData = extractInputData(payload, row, action);
+  const elementType = inferElementType(action, payload);
 
-          // 세션 보강
-          if (r.AZ_session_tab_id == null) r.AZ_session_tab_id = tabId;
-          if (r.AZ_session_browser_id == null) r.AZ_session_browser_id = BROWSER_SESSION_ID;
-
-          // URL 파생 보강
-          if (!r.AZ_url_host && r.AZ_url) r.AZ_url_host = urlHost(r.AZ_url);
-          if (!r.AZ_url_path && r.AZ_url) r.AZ_url_path = urlPath(r.AZ_url);
-
-          // API 메타 자동 부착
-          const meta = attachApi(r.AZ_url || "", tabId);
-          for (const k of Object.keys(meta)) {
-            if (r[k] == null) r[k] = meta[k];
-          }
-
-          // 데이터 중복 저장 방지용 event_id 추가
-          /*
-          LEGACY_FROM_pre_3bdec56:
-          초기 확장 버전은 event_id 앞에 시간 prefix를 붙였습니다.
-
-          const datePrefix = dt0().replace(" ", "-").replace(/:/g, "");
-          r.AZ_event_id =
-            datePrefix + "-" + (crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2)));
-
-          삭제 이유:
-          - UUID 앞에 timestamp를 더 붙이면 downstream VARCHAR(36) 제한을 넘길 수 있었습니다.
-          - 현재는 UUID 단독 사용으로 길이 안정성을 우선합니다.
-          */
-          if (r.AZ_event_id == null) {
-            r.AZ_event_id =
-              (crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2)));
-          }
-          return r;
-        });
-
-        const isEmptyNullChange = (r) =>
-          r?.AZ_event_action === "change" &&
-          !r?.AZ_data &&
-          !r?.AZ_element_uid &&
-          !r?.AZ_selector_css &&
-          !r?.AZ_selector_xpath &&
-          !r?.AZ_element_tag &&
-          !r?.AZ_element_text &&
-          !r?.AZ_associated_label;
-      
-        const filteredRows = rows.filter((r) => !isNoiseChangeRow(r));
-
-        // 탭 종료 상태 기록
-        if (filteredRows.length > 0 && tabId !== -1) {
-          lastRowByTab.set(tabId, filteredRows[filteredRows.length - 1]);
-        }
-
-        /*
-        CHANGE NOTE: code_after 는 전달받은 rows 를 그대로 적재했습니다.
-
-        LEGACY_FROM_code_after:
-        logAndBuffer(reason, rows);
-        sendResponse?.({ ok: true, logged: rows.length, mode: "rows" });
-
-        현재는 isNoiseChangeRow() 필터를 통과한 filteredRows 만 적재합니다.
-        변경 이유:
-        - 식별자/값/텍스트가 모두 없는 change 이벤트 제거
-        - DB/CSV 잡음 감소
-        - 마지막 의미 있는 row 를 tab 단위로 저장해 page_close 합성에 재사용
-        */
-        logAndBuffer(reason, filteredRows);
-        sendResponse?.({ ok: true, logged: filteredRows.length, mode: "rows" });
-        return;
-      }
-
-      // 2) 구 포맷: payload.events → 변환
-      const events = Array.isArray(msg.payload?.events) ? msg.payload.events : [];
-      const { loginId } = await chrome.storage.local.get("loginId");
-      const lid = typeof loginId === "string" && loginId.trim() ? loginId.trim() : "unknown";
-
-      const rows = [];
-      for (const ev of events) {
-        const row = eventToDbRow(ev, tabId, lid);
-        if (!row) continue;
-
-        if (row.AZ_session_tab_id == null) row.AZ_session_tab_id = tabId;
-        if (row.AZ_session_browser_id == null) row.AZ_session_browser_id = BROWSER_SESSION_ID;
-        rows.push(row);
-      }
-
-      const filteredRows = rows.filter((r) => !isNoiseChangeRow(r));
-
-      logAndBuffer(reason, filteredRows);
-      sendResponse?.({ ok: true, logged: filteredRows.length, mode: "events" });
-    } catch (e) {
-      console.error("[BATCH_EVENTS] handler failed", e);
-      sendResponse?.({ ok: false, error: String(e?.message || e) });
-    }
-  })();
-
-  return true; // ✅ async sendResponse 허용 (BATCH_EVENTS일 때만)
-});
-
-/*
-CHANGE NOTE: code_after 에는 탭 종료 시점의 합성 page_close row가 없었습니다.
-
-LEGACY_FROM_code_after:
-// 없음: 마지막 의미 있는 row를 기반으로 종료 이벤트를 남기는 로직이 없었음
-
-현재는 마지막 row를 복제해 page_close로 저장합니다.
-의도:
-- 사용자가 탭을 닫았다는 경계를 로그에 남기기 위함
-- pagehide 직전 유실된 종료 이벤트를 background에서 보정하기 위함
-*/
-function synthesizePageCloseFromLastRow(tabId, reason = "TAB_CLOSED") {
-  const lastRow = lastRowByTab.get(tabId);
-  if (!lastRow) return false;
-  if (lastRow.AZ_event_action === "page_close") return false;
-
-  const closeRow = { ...lastRow };
-  const lastLoc = closeRow.AZ_locators_json && typeof closeRow.AZ_locators_json === "object" && !Array.isArray(closeRow.AZ_locators_json) ? closeRow.AZ_locators_json : null;
-  closeRow.AZ_event_time = dt0(Date.now()); 
-  closeRow.AZ_element_type = "page";
-  closeRow.AZ_event_action = "page_close";
-  closeRow.AZ_element_uid = "PAGE";
-  closeRow.AZ_element_tag = "html";
-  closeRow.AZ_element_text = null;
-  closeRow.AZ_event_subtype = null;
-  closeRow.AZ_element_label = null;
-  closeRow.AZ_associated_label = null;
-  closeRow.AZ_data_testid = null;
-  closeRow.AZ_api_path = null;
-  closeRow.AZ_api_method = null;
-  closeRow.AZ_api_status = null;
-  closeRow.AZ_api_latency_ms = null;
-  closeRow.AZ_locators_json = {
-    a11y: { role: null, ariaLabel: null, ariaLabelledby: null },
-    testids: {},
-    attrs: { id: null, name: null, class: null },
-    bounds: { x: 0, y: 0, w: 0, h: 0 },
-    session: lastLoc?.session || null,
-    env: lastLoc?.env || null,
-    analysis: lastLoc?.analysis || null,
-  }
-  closeRow.AZ_data = null;
-  closeRow.AZ_selector_xpath = '/html[1]';
-  closeRow.AZ_selector_css = 'PAGE';
-  closeRow.AZ_associated_label = null;
-  closeRow.AZ_event_id = crypto.randomUUID ? crypto.randomUUID() : (Date.now().toString(36) + Math.random().toString(36).slice(2));
-  
-  // 64KB 용량 제한으로 인한 keepalive 전송 실패를 막기 위해 스냅샷 강제 제거
-  delete closeRow.snapshot;
-  closeRow.AZ_dom_before = null;
-  closeRow.AZ_dom_after = null;
-
-  logAndBuffer(reason, [closeRow]);
-  lastRowByTab.delete(tabId);
-
-  return true
-};
-
-chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
-  if (changeInfo.status !== "loading") return;
-
-  const nextUrl = changeInfo.url || tab?.pendingUrl || tab?.url || null;
-  if (!nextUrl) return;
-
-  // 같은 탭에서 새 문서 로딩이 시작되면 이전 페이지를 종료로 합성
-  // synthesizePageCloseFromLastRow(tabId, "TAB_NAVIGATED");
-});
-
-chrome.tabs.onRemoved.addListener((tabId, removeInfo) => {
-  // synthesizePageCloseFromLastRow(tabId, "TAB_CLOSED");
-  const synthesized = synthesizePageCloseFromLastRow(tabId, "TAB_CLOSED");
-  if (synthesized || UPLOAD_QUEUE.length) {
-    void flushUpload(true).catch((e) => {
-      console.warn("[INGEST] final flush failed", e);
-    });
-  }
-});
-
-// ✅ MAIN world에 fetch hook 설치 (CSP-safe)
-function AZ_installFetchHook_MAIN() {
-  try {
-    // 중복 설치 방지
-    if (window.__AZ_FETCH_HOOK_INSTALLED__) return;
-    window.__AZ_FETCH_HOOK_INSTALLED__ = true;
-
-    if (!window.fetch) return;
-
-    const ORIG_FETCH = window.fetch.bind(window);
-    const MAX_API_BODY = 100000;
-
-    window.fetch = async function (...args) {
-      const res = await ORIG_FETCH(...args);
-
-      try {
-        let url = res.url;
-        if (!url && typeof args[0] === "string") url = args[0];
-        if (!url && args[0] && typeof args[0] === "object" && args[0].url) url = args[0].url;
-
-        if (!url) return res;
-
-        // 필요 시 도메인 필터
-        const u = new URL(url, location.href);
-        /*
-        LEGACY_FROM_code_after:
-        if (u.host !== "c4web.c4mix.com") return res;
-
-        변경 이유:
-        - 특정 호스트 하나에만 묶어 두면 다른 업무 시스템/테스트 도메인에서 API body 수집이 막힌다.
-        - 현재는 도메인 제한을 주석 처리해 다중 도메인 테스트를 허용한다.
-        */
-        // if (u.host !== "c4web.c4mix.com") return res;
-
-        const cloned = res.clone();
-        const ct = (cloned.headers.get("content-type") || "").toLowerCase();
-
-        // 텍스트/JSON/XML만 저장
-        if (!ct.includes("json") && !ct.startsWith("text/") && !ct.includes("xml")) return res;
-
-        let bodyText = await cloned.text();
-        if (bodyText && bodyText.length > MAX_API_BODY) {
-          bodyText = bodyText.slice(0, MAX_API_BODY) + "\n/* clipped */";
-        }
-
-        window.postMessage(
-          {
-            source: "az-extension",
-            type: "AZ_FETCH_BODY",
-            url,
-            status: res.status,
-            method:
-              (args[1] && args[1].method) ||
-              (args[0] && args[0].method) ||
-              "GET",
-            body: bodyText,
-          },
-          "*"
-        );
-      } catch (_) {
-        // hook 실패는 조용히 무시
-      }
-
-      return res;
-    };
-  } catch (_) {}
+  return {
+    AZ_event_id: typeof row.event_id === "string" && row.event_id.trim() ? row.event_id : null,
+    AZ_event_time: eventTime,
+    AZ_event_ts_ms: toEventTimestampMs(eventTime),
+    AZ_event_action: action,
+    AZ_event_subtype: typeof payload.kind === "string" && payload.kind.trim() ? payload.kind : null,
+    AZ_login_id: loginId,
+    AZ_session_page_id: pageSessionId,
+    AZ_url: pageUrl,
+    AZ_url_path: toUrlPath(pageUrl),
+    AZ_page_title:
+      typeof row.page_title === "string" ? row.page_title : (typeof pageContext.page_title === "string" ? pageContext.page_title : null),
+    AZ_selector_css:
+      typeof row.selector_css === "string" ? row.selector_css : (typeof elementContext.selector_css === "string" ? elementContext.selector_css : null),
+    AZ_selector_xpath:
+      typeof row.selector_xpath === "string" ? row.selector_xpath : (typeof elementContext.selector_xpath === "string" ? elementContext.selector_xpath : null),
+    AZ_element_tag:
+      typeof row.element_tag === "string" ? row.element_tag : (typeof elementContext.element_tag === "string" ? elementContext.element_tag : null),
+    AZ_element_text:
+      typeof row.element_text === "string" ? row.element_text : (typeof elementContext.element_text === "string" ? elementContext.element_text : null),
+    AZ_element_type: elementType,
+    AZ_data: inputData,
+    AZ_input_length: typeof inputData === "string" ? inputData.length : null,
+    AZ_api_method: typeof apiContext.method === "string" ? apiContext.method : null,
+    AZ_api_url: typeof apiContext.url === "string" ? apiContext.url : null,
+    AZ_api_path: toUrlPath(apiContext.url),
+    AZ_api_status: apiContext.status ?? null,
+    AZ_api_latency_ms: apiContext.duration_ms ?? null,
+    AZ_data_testid: typeof elementContext.data_testid === "string" ? elementContext.data_testid : null,
+    AZ_associated_label: typeof elementContext.associated_label === "string" ? elementContext.associated_label : null,
+    AZ_locators_json: {
+      source: "extension_generic_row_bridge",
+      session: {
+        page_session_id: pageSessionId
+      },
+      page: toJsonSafeObject(pageContext),
+      element: toJsonSafeObject(elementContext),
+      input_context: toJsonSafeObject(inputContext),
+      api_context: toJsonSafeObject(apiContext),
+      relation_context: toJsonSafeObject(relationContext),
+      menu_context: toJsonSafeObject(menuContext),
+      ui_outcome: toJsonSafeObject(uiOutcome),
+      analysis: {
+        event_sequence: row.event_sequence ?? null,
+        interaction_id: row.interaction_id ?? null,
+        correlation_id: row.correlation_id ?? null,
+        collector_build: row.collector_build ?? COLLECTOR_VERSION,
+        extension_version: row.extension_version ?? payload.extension_version ?? COLLECTOR_VERSION,
+        extension_build: row.extension_build ?? payload.extension_build ?? null,
+        sdk_version: row.sdk_version ?? payload.sdk_version ?? null,
+        sdk_build: row.sdk_build ?? payload.sdk_build ?? null,
+        runtime_config_version: row.runtime_config_version ?? payload?.runtime_context?.config_version ?? null,
+        runtime_config_schema_version: row.runtime_config_schema_version ?? payload?.runtime_context?.schema_version ?? null,
+        runtime_rule_ids: row.runtime_rule_ids ?? payload?.runtime_context?.matched_rule_ids ?? null,
+        runtime_modules: row.runtime_modules ?? payload?.runtime_context?.active_module_names ?? null,
+        bounds: row.bounds ?? null
+      },
+      raw_payload: toJsonSafeObject(payload)
+    },
+    snapshot: row.snapshot ?? null
+  };
 }
 
-chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
-  if (msg?.type !== "AZ_INJECT_FETCH_HOOK") return;
+function normalizeRowsForUpload(rows, ingestUrl) {
+  if (!Array.isArray(rows)) return [];
+  return rows.map((row) => normalizeRowForCollector(row, ingestUrl));
+}
 
-  (async () => {
-    try {
-      const tabId = sender?.tab?.id;
-      if (tabId == null || tabId < 0) throw new Error("no_tab");
-
-      // ✅ sender.frameId로 “해당 프레임에만” 설치(중복/과다 설치 방지)
-      const frameIds =
-        typeof sender.frameId === "number" ? [sender.frameId] : undefined;
-
-      await chrome.scripting.executeScript({
-        target: frameIds ? { tabId, frameIds } : { tabId },
-        world: "MAIN",
-        func: AZ_installFetchHook_MAIN,
-      });
-
-      sendResponse?.({ ok: true });
-    } catch (e) {
-      console.warn("[AZ] inject fetch hook failed", e);
-      sendResponse?.({ ok: false, error: String(e?.message || e) });
+function buildQueueOverflowDiagnosticRow(droppedRowsCount) {
+  const eventTime = new Date().toISOString();
+  return {
+    event_id: `queue-overflow-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    event_sequence: null,
+    interaction_id: null,
+    event_time: eventTime,
+    page_session_id: null,
+    action: "queue_overflow",
+    collector_build: COLLECTOR_VERSION,
+    extension_version: COLLECTOR_VERSION,
+    extension_build: `shell-${COLLECTOR_VERSION}`,
+    sdk_version: null,
+    sdk_build: null,
+    page_url: null,
+    page_title: null,
+    selector_css: "PAGE",
+    selector_xpath: "/html[1]",
+    element_tag: "html",
+    element_text: "queue_overflow",
+    bounds: null,
+    correlation_id: null,
+    snapshot: null,
+    payload: {
+      kind: "collector_diagnostic",
+      event_context: {
+        reason: "background_queue_overflow"
+      },
+      page_context: {
+        page_session_id: null,
+        page_url: null,
+        page_title: null,
+        origin: null,
+        path: null,
+        search: null,
+        hash: null
+      },
+      element_context: {
+        selector_css: "PAGE",
+        selector_xpath: "/html[1]",
+        element_tag: "html",
+        element_text: "queue_overflow",
+        bounds: null
+      },
+      overflow_context: {
+        dropped_rows_count: droppedRowsCount,
+        max_queue_rows: MAX_QUEUE_ROWS,
+        reason: "background_queue_overflow"
+      },
+      legacy: {}
     }
-  })();
+  };
+}
 
-  return true; // async sendResponse
+function truncateQueueToMax() {
+  if (pendingRows.length <= MAX_QUEUE_ROWS) return;
+  const overflow = pendingRows.length - MAX_QUEUE_ROWS;
+  const existingDiagnostic = pendingRows.find((row) =>
+    row?.action === "queue_overflow" &&
+    row?.payload?.overflow_context?.reason === "background_queue_overflow"
+  );
+  const reserveForDiagnostic = existingDiagnostic ? 0 : 1;
+  const removed = pendingRows.splice(0, Math.min(pendingRows.length, overflow + reserveForDiagnostic));
+  const droppedRowsCount = removed.length;
+  if (existingDiagnostic) {
+    existingDiagnostic.event_time = new Date().toISOString();
+    existingDiagnostic.payload = {
+      ...(existingDiagnostic.payload || {}),
+      overflow_context: {
+        ...(existingDiagnostic.payload?.overflow_context || {}),
+        dropped_rows_count:
+          Number(existingDiagnostic.payload?.overflow_context?.dropped_rows_count || 0) + droppedRowsCount,
+        max_queue_rows: MAX_QUEUE_ROWS,
+        reason: "background_queue_overflow"
+      }
+    };
+  } else if (droppedRowsCount > 0) {
+    pendingRows.push(buildQueueOverflowDiagnosticRow(droppedRowsCount));
+  }
+  while (pendingRows.length > MAX_QUEUE_ROWS) {
+    pendingRows.shift();
+  }
+  console.warn(`[AZ_TEST] queue truncated by ${droppedRowsCount} rows to respect MAX_QUEUE_ROWS=${MAX_QUEUE_ROWS}`);
+}
+
+function estimateBatchBytes(rows) {
+  try {
+    return new TextEncoder().encode(JSON.stringify({ rows, ts: 0 })).length;
+  } catch {
+    return Number.MAX_SAFE_INTEGER;
+  }
+}
+
+function takeUploadBatch() {
+  if (pendingRows.length === 0) return [];
+
+  const batch = [];
+  for (const row of pendingRows) {
+    if (batch.length >= MAX_BATCH_ROWS) break;
+    const nextBatch = batch.concat(row);
+    const nextBytes = estimateBatchBytes(nextBatch);
+    if (batch.length > 0 && nextBytes > MAX_BATCH_BYTES) break;
+    batch.push(row);
+    if (nextBytes >= MAX_BATCH_BYTES) break;
+  }
+
+  return batch;
+}
+
+function computeRetryDelay(attempt) {
+  const exponentialDelay = BASE_RETRY_DELAY_MS * (2 ** Math.max(0, attempt - 1));
+  return Math.min(exponentialDelay, MAX_RETRY_DELAY_MS);
+}
+
+async function readCollectorConfig() {
+  const stored = await chrome.storage.local.get([
+    COLLECTOR_INGEST_URL_KEY,
+    TENANT_ID_KEY,
+    COLLECTOR_KEY_KEY,
+    RUNTIME_CONFIG_URL_KEY
+  ]);
+
+  return {
+    collectorIngestUrl:
+      typeof stored?.[COLLECTOR_INGEST_URL_KEY] === "string" && stored[COLLECTOR_INGEST_URL_KEY].trim()
+        ? stored[COLLECTOR_INGEST_URL_KEY].trim()
+        : null,
+    tenantId:
+      typeof stored?.[TENANT_ID_KEY] === "string" && stored[TENANT_ID_KEY].trim()
+        ? stored[TENANT_ID_KEY].trim()
+        : "",
+    collectorKey:
+      typeof stored?.[COLLECTOR_KEY_KEY] === "string" && stored[COLLECTOR_KEY_KEY].trim()
+        ? stored[COLLECTOR_KEY_KEY].trim()
+        : "",
+    collectorRuntimeConfigUrl:
+      typeof stored?.[RUNTIME_CONFIG_URL_KEY] === "string" && stored[RUNTIME_CONFIG_URL_KEY].trim()
+        ? stored[RUNTIME_CONFIG_URL_KEY].trim()
+        : null
+  };
+}
+
+function isDevelopmentCollectorUrl(url) {
+  if (typeof url !== "string") return false;
+  try {
+    const parsed = new URL(url);
+    return parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
+  } catch {
+    return false;
+  }
+}
+
+async function injectCollectorScript(tabId) {
+  if (typeof tabId !== "number") return;
+  try {
+    await chrome.scripting.executeScript({
+      target: { tabId, allFrames: true },
+      files: ["content.js"]
+    });
+  } catch (error) {
+    console.warn("[AZ_TEST] content injection failed", error);
+  }
+}
+
+async function injectCollectorIntoMatchingTabs() {
+  const tabs = await chrome.tabs.query({});
+  await Promise.all(tabs
+    .filter((tab) => matchesCollectorTarget(tab.url))
+    .map((tab) => injectCollectorScript(tab.id)));
+}
+
+async function hydrateQueue() {
+  if (hydrated) return;
+  const stored = await chrome.storage.local.get(QUEUE_KEY);
+  const rows = Array.isArray(stored?.[QUEUE_KEY]) ? stored[QUEUE_KEY] : [];
+  pendingRows.push(...rows);
+  truncateQueueToMax();
+  hydrated = true;
+}
+
+async function persistQueue() {
+  truncateQueueToMax();
+  await chrome.storage.local.set({ [QUEUE_KEY]: pendingRows });
+}
+
+async function enqueueRows(rows) {
+  if (!Array.isArray(rows) || rows.length === 0) return;
+  await hydrateQueue();
+  pendingRows.push(...rows);
+  truncateQueueToMax();
+  await persistQueue();
+  scheduleUpload();
+}
+
+function scheduleUpload(delayMs = BASE_UPLOAD_DELAY_MS) {
+  if (uploadInFlight) {
+    flushRequestedWhileInFlight = true;
+    return;
+  }
+  if (uploadTimer) return;
+  uploadTimer = setTimeout(() => {
+    uploadTimer = null;
+    void flushUpload();
+  }, Math.max(0, delayMs));
+}
+
+async function ensureQueueFlushAlarm() {
+  if (!chrome.alarms?.create) return;
+  try {
+    await chrome.alarms.create(QUEUE_FLUSH_ALARM_NAME, {
+      periodInMinutes: QUEUE_FLUSH_ALARM_PERIOD_MINUTES
+    });
+  } catch (error) {
+    console.warn("[AZ_TEST] queue flush alarm setup failed", error);
+  }
+}
+
+async function wakeQueueFlush(reason = "alarm") {
+  await hydrateQueue();
+  if (pendingRows.length === 0) return;
+  console.info("[AZ_TEST] queue flush wake", { reason, pendingRows: pendingRows.length });
+  scheduleUpload(0);
+}
+
+function resolveIngestUrl(rows, config) {
+  const sourcePageUrl = firstSourcePageUrl(rows);
+  if (isC4WebPageUrl(sourcePageUrl)) {
+    return DEFAULT_INGEST_URL;
+  }
+
+  if (config?.collectorIngestUrl) {
+    return config.collectorIngestUrl;
+  }
+
+  if (typeof sourcePageUrl === "string" && isDevelopmentCollectorUrl(sourcePageUrl)) {
+    try {
+      return new URL("/ingest/batch", sourcePageUrl).toString();
+    } catch {}
+  }
+
+  return DEFAULT_INGEST_URL;
+}
+
+function normalizeRuntimeConfig(value, source = "extension-default") {
+  const config = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+  const ttlMs = Number(config.ttl_ms);
+  const apiCapture = config.api_capture && typeof config.api_capture === "object" && !Array.isArray(config.api_capture)
+    ? config.api_capture
+    : {};
+  const apiTransactionTtlMs = Number(apiCapture.transaction_ttl_ms);
+  const apiMaxBufferSize = Number(apiCapture.max_buffer_size);
+
+  return {
+    ...DEFAULT_RUNTIME_CONFIG,
+    schema_version: Number.isFinite(Number(config.schema_version)) ? Math.trunc(Number(config.schema_version)) : 1,
+    version: typeof config.version === "string" && config.version.trim() ? config.version.trim() : "local-default",
+    source,
+    fetched_at: typeof config.fetched_at === "string" && config.fetched_at.trim() ? config.fetched_at : null,
+    ttl_ms: Number.isFinite(ttlMs) && ttlMs > 0 ? Math.min(ttlMs, 60 * 60 * 1000) : DEFAULT_RUNTIME_CONFIG_TTL_MS,
+    modules: config.modules && typeof config.modules === "object" && !Array.isArray(config.modules) ? config.modules : {},
+    event_types: config.event_types && typeof config.event_types === "object" && !Array.isArray(config.event_types) ? config.event_types : {},
+    selector_packs: config.selector_packs && typeof config.selector_packs === "object" && !Array.isArray(config.selector_packs) ? config.selector_packs : {},
+    workflow_rules: Array.isArray(config.workflow_rules) ? config.workflow_rules.slice(0, 200) : [],
+    privacy: config.privacy && typeof config.privacy === "object" && !Array.isArray(config.privacy) ? config.privacy : {},
+    api_capture: {
+      ...DEFAULT_API_CAPTURE_CONFIG,
+      ...apiCapture,
+      enabled: apiCapture.enabled !== false,
+      transaction_mode: apiCapture.transaction_mode !== false,
+      emit_legacy_api_rows: apiCapture.emit_legacy_api_rows === true,
+      capture_request_body: false,
+      capture_response_body: false,
+      capture_headers: false,
+      allowed_header_names: Array.isArray(apiCapture.allowed_header_names) ? apiCapture.allowed_header_names.slice(0, 50) : [],
+      transaction_ttl_ms: Number.isFinite(apiTransactionTtlMs) && apiTransactionTtlMs > 0
+        ? Math.min(apiTransactionTtlMs, 120000)
+        : DEFAULT_API_CAPTURE_CONFIG.transaction_ttl_ms,
+      max_buffer_size: Number.isFinite(apiMaxBufferSize) && apiMaxBufferSize > 0
+        ? Math.min(Math.trunc(apiMaxBufferSize), 2000)
+        : DEFAULT_API_CAPTURE_CONFIG.max_buffer_size
+    }
+  };
+}
+
+function runtimeConfigIsFresh(cache) {
+  const fetchedAtMs = Number(cache?.fetchedAtMs || 0);
+  const ttlMs = Number(cache?.config?.ttl_ms || DEFAULT_RUNTIME_CONFIG_TTL_MS);
+  return cache?.config && fetchedAtMs > 0 && Date.now() - fetchedAtMs <= ttlMs;
+}
+
+function resolveRuntimeConfigUrl(pageUrl, config) {
+  if (config?.collectorRuntimeConfigUrl) return config.collectorRuntimeConfigUrl;
+  const ingestUrl = resolveIngestUrl([{ page_url: pageUrl || null }], config);
+  try {
+    return new URL("/collector/runtime-config", ingestUrl).toString();
+  } catch {
+    return null;
+  }
+}
+
+async function readRuntimeConfigForPage(pageUrl = null) {
+  const stored = await chrome.storage.local.get(RUNTIME_CONFIG_CACHE_KEY);
+  const cached = stored?.[RUNTIME_CONFIG_CACHE_KEY];
+  if (runtimeConfigIsFresh(cached)) return cached.config;
+
+  const config = await readCollectorConfig();
+  const runtimeConfigUrl = resolveRuntimeConfigUrl(pageUrl, config);
+  if (!runtimeConfigUrl) return normalizeRuntimeConfig(null);
+
+  try {
+    const collectorKey = isProdCollectorUrl(runtimeConfigUrl)
+      ? DEFAULT_PROD_COLLECTOR_KEY
+      : (config.collectorKey || "");
+    const response = await fetch(runtimeConfigUrl, {
+      method: "GET",
+      headers: {
+        "X-Collector-Version": COLLECTOR_VERSION,
+        ...(config.tenantId ? { "X-Tenant-Id": config.tenantId } : {}),
+        ...(collectorKey ? {
+          "x-api-key": collectorKey,
+          "X-Collector-Key": collectorKey
+        } : {})
+      }
+    });
+
+    if (!response.ok) {
+      throw new Error(`runtime_config_failed_${response.status}`);
+    }
+
+    const nextConfig = normalizeRuntimeConfig(await response.json(), "server");
+    await chrome.storage.local.set({
+      [RUNTIME_CONFIG_CACHE_KEY]: {
+        config: nextConfig,
+        fetchedAtMs: Date.now(),
+        url: runtimeConfigUrl
+      }
+    });
+    return nextConfig;
+  } catch (error) {
+    if (cached?.config) {
+      return {
+        ...normalizeRuntimeConfig(cached.config, "cache-stale"),
+        load_error: String(error?.message || error)
+      };
+    }
+    return {
+      ...normalizeRuntimeConfig(null),
+      load_error: String(error?.message || error)
+    };
+  }
+}
+
+function debugLogUploadPayload(ingestUrl, sourceRows, payload) {
+  if (!DEBUG_LOG_ALL_UPLOAD_PAYLOADS) return;
+  try {
+    const rowCount = Array.isArray(payload?.rows) ? payload.rows.length : 0;
+    console.groupCollapsed(`[collector-debug] background->ingest rows=${rowCount}`);
+    console.log("ingestUrl", ingestUrl);
+    console.log("sourceRows", sourceRows);
+    console.log("payload", payload);
+    console.groupEnd();
+  } catch (error) {
+    console.log("[collector-debug] upload payload", { ingestUrl, sourceRows, payload });
+  }
+}
+
+async function flushUpload() {
+  await hydrateQueue();
+  if (uploadInFlight || pendingRows.length === 0) return;
+
+  uploadInFlight = true;
+  flushRequestedWhileInFlight = false;
+  const rows = takeUploadBatch();
+  const config = await readCollectorConfig();
+  const ingestUrl = resolveIngestUrl(rows, config);
+  const uploadRows = normalizeRowsForUpload(rows, ingestUrl);
+  const sourcePageUrl = firstSourcePageUrl(rows);
+  const collectorKey =
+    isC4WebPageUrl(sourcePageUrl) || isProdCollectorUrl(ingestUrl)
+      ? DEFAULT_PROD_COLLECTOR_KEY
+      : (config.collectorKey || "");
+  let shouldContinue = false;
+  let retryDelay = null;
+
+  try {
+    if (uploadRows.length === 0) return;
+
+    const uploadPayload = { rows: uploadRows, ts: Date.now() };
+    debugLogUploadPayload(ingestUrl, rows, uploadPayload);
+
+    const response = await fetch(ingestUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Collector-Version": COLLECTOR_VERSION,
+        ...(config.tenantId ? { "X-Tenant-Id": config.tenantId } : {}),
+        ...(collectorKey ? {
+          "x-api-key": collectorKey,
+          "X-Collector-Key": collectorKey
+        } : {})
+      },
+      body: JSON.stringify(uploadPayload)
+    });
+
+    if (!response.ok) {
+      throw new Error(`ingest_failed_${response.status}`);
+    }
+
+    pendingRows.splice(0, rows.length);
+    await persistQueue();
+    retryAttempt = 0;
+    shouldContinue = pendingRows.length > 0;
+  } catch (error) {
+    console.warn("[AZ_TEST] ingest retry scheduled", error);
+    retryAttempt += 1;
+    retryDelay = computeRetryDelay(retryAttempt);
+  } finally {
+    uploadInFlight = false;
+    if (retryDelay != null) {
+      scheduleUpload(retryDelay);
+      return;
+    }
+    if (shouldContinue || flushRequestedWhileInFlight) {
+      flushRequestedWhileInFlight = false;
+      scheduleUpload(0);
+    }
+  }
+}
+
+function installMainWorldBridge(bridgeNonce) {
+  if (window.__AZ_TEST_BRIDGE_INSTALLED__) return;
+  window.__AZ_TEST_BRIDGE_INSTALLED__ = true;
+
+  const post = (type, payload) => {
+    window.postMessage({
+      source: "az-collector-test",
+      nonce: bridgeNonce,
+      type,
+      payload
+    }, "*");
+  };
+
+  const isInternalCollectorEndpoint = (url) => {
+    try {
+      const parsed = new URL(url, location.href);
+      return (
+        parsed.pathname === "/collector-test/events" ||
+        parsed.pathname === "/collector-test/db-status" ||
+        parsed.pathname === "/collector-test/dev/content.js" ||
+        parsed.pathname === "/ingest/batch"
+      );
+    } catch {
+      return /\/collector-test\/events|\/collector-test\/db-status|\/collector-test\/dev\/content\.js|\/ingest\/batch/.test(String(url || ""));
+    }
+  };
+
+  const markInternalCollectorPayload = (payload) => {
+    if (!payload || !isInternalCollectorEndpoint(payload.url)) return payload;
+    return {
+      ...payload,
+      requestBody: "[INTERNAL_COLLECTOR_BODY_SKIPPED]",
+      responseBody: "[INTERNAL_COLLECTOR_BODY_SKIPPED]",
+      body_capture_skipped: true,
+      body_capture_skip_reason: "internal_collector_endpoint"
+    };
+  };
+
+  const postStateSnapshotFromCollector = (kind, requestId, collectorFn, detail) => {
+    let raw = null;
+    try {
+      raw = typeof collectorFn === "function" ? collectorFn(detail || {}) : null;
+    } catch (error) {
+      const receivedAtMs = Date.now();
+      post("STATE_SNAPSHOT", {
+        kind,
+        requestId,
+        value: null,
+        receivedAt: new Date(receivedAtMs).toISOString(),
+        receivedAtMs,
+        error: {
+          message: error?.message || String(error),
+          type: error?.name || "adapter_error"
+        }
+      });
+      return;
+    }
+
+    Promise.resolve(raw)
+      .then((value) => {
+        const receivedAtMs = Date.now();
+        post("STATE_SNAPSHOT", {
+          kind,
+          requestId,
+          value,
+          receivedAt: new Date(receivedAtMs).toISOString(),
+          receivedAtMs
+        });
+      })
+      .catch((error) => {
+        const receivedAtMs = Date.now();
+        post("STATE_SNAPSHOT", {
+          kind,
+          requestId,
+          value: null,
+          receivedAt: new Date(receivedAtMs).toISOString(),
+          receivedAtMs,
+          error: {
+            message: error?.message || String(error),
+            type: error?.name || "adapter_error"
+          }
+        });
+      });
+  };
+
+  let __azRouteUrl = location.href;
+  const emitRouteChange = (trigger) => {
+    const fromUrl = __azRouteUrl;
+    const toUrl = location.href;
+    if (fromUrl === toUrl) return;
+    __azRouteUrl = toUrl;
+    post("ROUTE_CHANGE", {
+      trigger,
+      fromUrl,
+      toUrl,
+      changedAt: Date.now()
+    });
+  };
+
+  try {
+    const originalPushState = history.pushState;
+    history.pushState = function(...args) {
+      const result = originalPushState.apply(this, args);
+      queueMicrotask(() => emitRouteChange("pushState"));
+      return result;
+    };
+
+    const originalReplaceState = history.replaceState;
+    history.replaceState = function(...args) {
+      const result = originalReplaceState.apply(this, args);
+      queueMicrotask(() => emitRouteChange("replaceState"));
+      return result;
+    };
+
+    window.addEventListener("popstate", () => queueMicrotask(() => emitRouteChange("popstate")), true);
+    window.addEventListener("hashchange", () => queueMicrotask(() => emitRouteChange("hashchange")), true);
+  } catch (error) {
+    console.warn("[AZ_TEST] route hook failed", error);
+  }
+
+  if (window.fetch) {
+    const originalFetch = window.fetch.bind(window);
+    window.fetch = async (...args) => {
+      const request = args[0];
+      const init = args[1] || {};
+      const method = (init.method || request?.method || "GET").toUpperCase();
+      const requestBody = init.body ?? request?.body ?? null;
+      const requestId = crypto.randomUUID ? crypto.randomUUID() : `fetch-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+      const startedAtMs = Date.now();
+      post("FETCH_START", {
+        requestId,
+        url: String(request?.url || request || ""),
+        method,
+        startedAt: new Date(startedAtMs).toISOString(),
+        startedAtMs
+      });
+      let response;
+      try {
+        response = await originalFetch(...args);
+      } catch (error) {
+        const endedAtMs = Date.now();
+        post("FETCH_ERROR", markInternalCollectorPayload({
+          requestId,
+          url: String(request?.url || request || ""),
+          method,
+          status: null,
+          startedAt: new Date(startedAtMs).toISOString(),
+          startedAtMs,
+          endedAt: new Date(endedAtMs).toISOString(),
+          endedAtMs,
+          durationMs: endedAtMs - startedAtMs,
+          requestBody,
+          responseBody: null,
+          errorType: error?.name || "fetch_error",
+          errorMessage: error?.message || String(error || "fetch_error"),
+          failureStage: "request_failed",
+          correlationId:
+            init.headers?.["X-AZ-Correlation-Id"] ||
+            init.headers?.["x-az-correlation-id"] ||
+            null
+        }));
+        throw error;
+      }
+
+      const endedAtMs = Date.now();
+
+      try {
+        const clone = response.clone();
+        const contentType = (clone.headers.get("content-type") || "").toLowerCase();
+        if (contentType.includes("json") || contentType.startsWith("text/")) {
+          const responseBody = await clone.text();
+          post("FETCH_HOOK", markInternalCollectorPayload({
+            requestId,
+            url: response.url || String(request?.url || request || ""),
+            method,
+            status: response.status,
+            startedAt: new Date(startedAtMs).toISOString(),
+            startedAtMs,
+            endedAt: new Date(endedAtMs).toISOString(),
+            endedAtMs,
+            durationMs: endedAtMs - startedAtMs,
+            requestBody,
+            responseBody,
+            correlationId:
+              init.headers?.["X-AZ-Correlation-Id"] ||
+              init.headers?.["x-az-correlation-id"] ||
+              null
+          }));
+        }
+      } catch (error) {
+        console.warn("[AZ_TEST] fetch hook failed", error);
+      }
+
+      return response;
+    };
+  }
+
+  const originalOpen = XMLHttpRequest.prototype.open;
+  const originalSend = XMLHttpRequest.prototype.send;
+  const originalSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+  XMLHttpRequest.prototype.open = function(method, url, ...rest) {
+    this.__az_test_method = method;
+    this.__az_test_url = url;
+    this.__az_test_headers = {};
+    this.__az_test_request_id = crypto.randomUUID ? crypto.randomUUID() : `xhr-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    return originalOpen.call(this, method, url, ...rest);
+  };
+
+  XMLHttpRequest.prototype.setRequestHeader = function(name, value) {
+    this.__az_test_headers[name] = value;
+    return originalSetHeader.call(this, name, value);
+  };
+
+  XMLHttpRequest.prototype.send = function(body) {
+    this.__az_test_body = body;
+    this.__az_test_started_at_ms = Date.now();
+    post("XHR_START", {
+      requestId: this.__az_test_request_id,
+      url: this.__az_test_url || "",
+      method: this.__az_test_method || "GET",
+      startedAt: new Date(this.__az_test_started_at_ms).toISOString(),
+      startedAtMs: this.__az_test_started_at_ms
+    });
+    const postXhrFailure = (eventType) => {
+      try {
+        const endedAtMs = Date.now();
+        this.__az_test_failed = true;
+        post("XHR_ERROR", markInternalCollectorPayload({
+          requestId: this.__az_test_request_id,
+          url: this.responseURL || this.__az_test_url || "",
+          method: this.__az_test_method || "GET",
+          status: null,
+          startedAt: new Date(this.__az_test_started_at_ms || endedAtMs).toISOString(),
+          startedAtMs: this.__az_test_started_at_ms || endedAtMs,
+          endedAt: new Date(endedAtMs).toISOString(),
+          endedAtMs,
+          durationMs: endedAtMs - (this.__az_test_started_at_ms || endedAtMs),
+          requestBody: this.__az_test_body ?? null,
+          responseBody: null,
+          errorType: eventType,
+          errorMessage: eventType,
+          failureStage: "request_failed",
+          correlationId:
+            this.__az_test_headers["X-AZ-Correlation-Id"] ||
+            this.__az_test_headers["x-az-correlation-id"] ||
+            null
+        }));
+      } catch (error) {
+        console.warn("[AZ_TEST] xhr error hook failed", error);
+      }
+    };
+
+    this.addEventListener("error", function() {
+      postXhrFailure("xhr_error");
+    }, { once: true });
+
+    this.addEventListener("timeout", function() {
+      postXhrFailure("xhr_timeout");
+    }, { once: true });
+
+    this.addEventListener("abort", function() {
+      postXhrFailure("xhr_abort");
+    }, { once: true });
+
+    this.addEventListener("loadend", function() {
+      try {
+        if (this.__az_test_failed) return;
+        const endedAtMs = Date.now();
+        post("XHR_HOOK", markInternalCollectorPayload({
+          requestId: this.__az_test_request_id,
+          url: this.responseURL || this.__az_test_url || "",
+          method: this.__az_test_method || "GET",
+          status: this.status,
+          startedAt: new Date(this.__az_test_started_at_ms || endedAtMs).toISOString(),
+          startedAtMs: this.__az_test_started_at_ms || endedAtMs,
+          endedAt: new Date(endedAtMs).toISOString(),
+          endedAtMs,
+          durationMs: endedAtMs - (this.__az_test_started_at_ms || endedAtMs),
+          requestBody: this.__az_test_body ?? null,
+          responseBody: typeof this.responseText === "string" ? this.responseText : null,
+          correlationId:
+            this.__az_test_headers["X-AZ-Correlation-Id"] ||
+            this.__az_test_headers["x-az-correlation-id"] ||
+            null
+        }));
+      } catch (error) {
+        console.warn("[AZ_TEST] xhr hook failed", error);
+      }
+    }, { once: true });
+
+    return originalSend.call(this, body);
+  };
+
+  window.addEventListener("AZ_TEST_REQUEST_STATE", (event) => {
+    const kind = event.detail?.kind || null;
+    const requestId = event.detail?.requestId || null;
+
+    if (kind === "canvas") {
+      const receivedAtMs = Date.now();
+      post("STATE_SNAPSHOT", {
+        kind,
+        requestId,
+        value: window.__AZ_CANVAS_MODEL__ ?? null,
+        receivedAt: new Date(receivedAtMs).toISOString(),
+        receivedAtMs
+      });
+      return;
+    }
+
+    if (kind === "grid_models") {
+      postStateSnapshotFromCollector(kind, requestId, window.__AZ_TEST_COLLECT_GRID_MODELS__, event.detail || {});
+      return;
+    }
+
+    if (kind === "nexacro") {
+      postStateSnapshotFromCollector(kind, requestId, window.__AZ_TEST_COLLECT_NEXACRO__, event.detail || {});
+      return;
+    }
+
+    if (kind === "websquare") {
+      postStateSnapshotFromCollector(kind, requestId, window.__AZ_TEST_COLLECT_WEBSQUARE__, event.detail || {});
+      return;
+    }
+
+    if (kind === "exbuilder6") {
+      postStateSnapshotFromCollector(kind, requestId, window.__AZ_TEST_COLLECT_EXBUILDER6__, event.detail || {});
+    }
+  });
+}
+
+chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
+  if (message?.type === "GET_RUNTIME_CONFIG") {
+    void readRuntimeConfigForPage(message.pageUrl || sender?.tab?.url || null)
+      .then((config) => {
+        sendResponse?.({ ok: true, config });
+      })
+      .catch((error) => {
+        sendResponse?.({
+          ok: false,
+          config: DEFAULT_RUNTIME_CONFIG,
+          error: String(error?.message || error)
+        });
+      });
+    return true;
+  }
+
+  if (message?.type === "BATCH_ROWS") {
+    void enqueueRows(message.rows || []).then(() => {
+      sendResponse?.({ ok: true, count: message.rows?.length || 0 });
+    });
+    return true;
+  }
+
+  if (message?.type === "INJECT_MAIN_WORLD") {
+    const tabId = sender?.tab?.id;
+    const frameId = sender?.frameId;
+    if (typeof tabId !== "number") {
+      sendResponse?.({ ok: false });
+      return;
+    }
+
+    void chrome.scripting.executeScript({
+      target: typeof frameId === "number" ? { tabId, frameIds: [frameId] } : { tabId },
+      world: "MAIN",
+      func: installMainWorldBridge,
+      args: [message.nonce || null]
+    }).then(() => {
+      sendResponse?.({ ok: true });
+    }).catch((error) => {
+      console.warn("[AZ_TEST] bridge injection failed", error);
+      sendResponse?.({ ok: false, error: String(error?.message || error) });
+    });
+    return true;
+  }
 });
 
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.status !== "complete") return;
+  if (!matchesCollectorTarget(tab.url)) return;
+  void injectCollectorScript(tabId);
+});
+
+chrome.runtime.onInstalled.addListener(() => {
+  void ensureQueueFlushAlarm();
+  void injectCollectorIntoMatchingTabs();
+  void wakeQueueFlush("runtime_installed");
+});
+
+chrome.runtime.onStartup.addListener(() => {
+  void ensureQueueFlushAlarm();
+  void injectCollectorIntoMatchingTabs();
+  void wakeQueueFlush("runtime_startup");
+});
+
+if (chrome.alarms?.onAlarm) {
+  chrome.alarms.onAlarm.addListener((alarm) => {
+    if (alarm?.name !== QUEUE_FLUSH_ALARM_NAME) return;
+    void wakeQueueFlush("alarm");
+  });
+}
+
+void ensureQueueFlushAlarm();
+
+void hydrateQueue().then(() => {
+  if (pendingRows.length > 0) {
+    scheduleUpload(0);
+  }
+});
