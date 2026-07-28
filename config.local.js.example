@@ -1,0 +1,3 @@
+globalThis.RAINBOW_COLLECTOR_CONFIG = Object.freeze({
+  prodCollectorKey: "<PROD_COLLECTOR_KEY>"
+});

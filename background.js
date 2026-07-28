@@ -1,5 +1,12 @@
-const DEFAULT_INGEST_URL = "http://192.168.131.128:8080/ingest/batch";
-const DEFAULT_PROD_COLLECTOR_KEY = "test_key";
+try {
+  importScripts("config.local.js");
+} catch {}
+
+const DEFAULT_INGEST_URL = "https://rainbowlab.ai.kr/ingest/batch";
+const DEFAULT_PROD_COLLECTOR_KEY =
+  typeof globalThis.RAINBOW_COLLECTOR_CONFIG?.prodCollectorKey === "string"
+    ? globalThis.RAINBOW_COLLECTOR_CONFIG.prodCollectorKey.trim()
+    : "";
 const COLLECTOR_VERSION = chrome.runtime?.getManifest?.().version || "0.1.1";
 const QUEUE_KEY = "AZ_TEST_PENDING_ROWS";
 const COLLECTOR_INGEST_URL_KEY = "collectorIngestUrl";
@@ -10,7 +17,7 @@ const RUNTIME_CONFIG_CACHE_KEY = "AZ_TEST_RUNTIME_CONFIG_CACHE";
 const DEFAULT_RUNTIME_CONFIG_TTL_MS = 5 * 60 * 1000;
 const QUEUE_FLUSH_ALARM_NAME = "AZ_TEST_QUEUE_FLUSH_WAKE";
 const QUEUE_FLUSH_ALARM_PERIOD_MINUTES = 1;
-const DEBUG_LOG_ALL_UPLOAD_PAYLOADS = true;
+const DEBUG_LOG_ALL_UPLOAD_PAYLOADS = false;
 const DEFAULT_API_CAPTURE_CONFIG = Object.freeze({
   enabled: true,
   transaction_mode: true,
@@ -37,27 +44,23 @@ const DEFAULT_RUNTIME_CONFIG = Object.freeze({
 const MAX_QUEUE_ROWS = 2000;
 const MAX_BATCH_ROWS = 100;
 const MAX_BATCH_BYTES = 256 * 1024;
-const BASE_UPLOAD_DELAY_MS = 800;
+const QUEUE_URGENT_FLUSH_ROWS = Math.floor(MAX_QUEUE_ROWS * 0.8);
+const QUEUE_HARD_MAX_ROWS = MAX_QUEUE_ROWS + MAX_BATCH_ROWS;
+const BASE_UPLOAD_DELAY_MS = 3000;
 const BASE_RETRY_DELAY_MS = 1000;
 const MAX_RETRY_DELAY_MS = 30000;
 const CONTENT_SCRIPT_MATCHERS = [
-  /^http:\/\/localhost:4175\//,
-  /^http:\/\/127\.0\.0\.1:4175\//,
-  /^http:\/\/localhost:4181\//,
-  /^http:\/\/127\.0\.0\.1:4181\//,
-  /^http:\/\/localhost:5173\/collector-test(?:[/?#]|$)/,
-  /^http:\/\/127\.0\.0\.1:5173\/collector-test(?:[/?#]|$)/,
-  /^https:\/\/example\.websquare\.kr\//,
-  /^https:\/\/demo\.tobesoft\.com\//,
-  /^https:\/\/c4web\.c4mix\.com\//,
+  /^http:\/\/211\.109\.22\.33:8791\//,
   /^https:\/\/rainbowlab\.ai\.kr\/rbem(?:[/?#]|$)/,
   /^https:\/\/rainbowlab\.ai\.kr\/mypage(?:[/?#]|$)/
 ];
 let uploadTimer = null;
+let uploadTimerIsDebounceable = false;
 let uploadInFlight = false;
 let hydrated = false;
 let flushRequestedWhileInFlight = false;
 let retryAttempt = 0;
+let scheduledUploadReason = "content script가 전달한 수집 데이터를 서버로 전송";
 const pendingRows = [];
 
 function matchesCollectorTarget(url) {
@@ -70,27 +73,134 @@ function firstSourcePageUrl(rows) {
     : null;
 }
 
+function actionLabel(action) {
+  const key = String(action || "unknown");
+  const labels = {
+    collector_boot: "수집기 시작",
+    page_view: "페이지 진입",
+    route_change: "화면 이동",
+    click: "클릭",
+    canvas_click: "캔버스 클릭",
+    keydown: "키 입력",
+    change: "입력값 확정",
+    input: "입력 중",
+    submit: "폼 제출",
+    api_transaction: "Request/Response 완료",
+    api_transaction_error: "Request/Response 실패",
+    api_transaction_timeout: "Request/Response 시간 초과",
+    modal_open: "팝업 열림",
+    modal_close: "팝업 닫힘",
+    toast_message: "토스트 메시지",
+    popup_open: "팝업 열림",
+    popup_close: "팝업 닫힘",
+    grid_cell_click: "그리드 셀 클릭",
+    grid_row_select: "그리드 행 선택",
+    grid_context_enrichment: "그리드 보강"
+  };
+  return labels[key] || key;
+}
+
+function summarizeRowsForConsole(rows) {
+  const list = Array.isArray(rows) ? rows : [];
+  const actionCounts = {};
+  for (const row of list) {
+    const action = row?.action || "unknown";
+    const label = actionLabel(action);
+    actionCounts[label] = (actionCounts[label] || 0) + 1;
+  }
+
+  const actions = new Set(list.map((row) => row?.action).filter(Boolean));
+  let reason = "수집된 이벤트를 서버 저장소로 전송";
+  if (actions.has("api_transaction_timeout")) {
+    reason = "Request는 감지됐지만 Response가 제한 시간 안에 오지 않아 timeout 이벤트를 전송";
+  } else if (actions.has("api_transaction_error")) {
+    reason = "Request/Response 처리 중 실패가 발생해 실패 이벤트를 전송";
+  } else if (actions.has("api_transaction")) {
+    reason = "Request와 Response가 한 쌍으로 묶여 API transaction 이벤트를 전송";
+  } else if (actions.has("submit")) {
+    reason = "폼 제출 사용자 행동이 발생해 후속 API/화면 변화와 연결할 이벤트를 전송";
+  } else if (actions.has("grid_cell_click") || actions.has("grid_row_select")) {
+    reason = "그리드 행/셀 선택이 발생해 선택 행 구조와 후속 API 연결 이벤트를 전송";
+  } else if (actions.has("popup_open") || actions.has("popup_close")) {
+    reason = "팝업 열림/닫힘 lifecycle이 발생해 팝업 상태 이벤트를 전송";
+  } else if (actions.has("click") || actions.has("canvas_click")) {
+    reason = "사용자 클릭이 발생해 업무 흐름 시작점 이벤트를 전송";
+  } else if (actions.has("change") || actions.has("input") || actions.has("keydown")) {
+    reason = "입력값 변경 또는 키 입력이 발생해 사용자 행동 이벤트를 전송";
+  } else if (actions.has("route_change")) {
+    reason = "화면 경로가 바뀌어 이전 행동/API 결과와 연결할 route_change 이벤트를 전송";
+  } else if (actions.has("page_view") || actions.has("collector_boot")) {
+    reason = "페이지 진입 또는 수집기 시작 상태를 기록하기 위해 전송";
+  }
+
+  return {
+    rowCount: list.length,
+    reason,
+    actionCounts,
+    preview: list.slice(0, 5).map((row) => ({
+      action: row?.action || null,
+      label: actionLabel(row?.action),
+      event_id: row?.event_id || null,
+      page_url: row?.page_url || null,
+      selector: row?.selector_css || row?.selector_xpath || null,
+      api_url: row?.payload?.api_context?.url || row?.AZ_api_url || null,
+      status: row?.payload?.api_context?.status ?? row?.AZ_api_status ?? null
+    }))
+  };
+}
+
 function isProdCollectorUrl(url) {
   if (typeof url !== "string") return false;
   try {
     const parsed = new URL(url);
-    return parsed.hostname === "rainbowlab.ai.kr" || parsed.hostname === "192.168.131.128";
+    return parsed.protocol === "https:" && parsed.hostname === "rainbowlab.ai.kr";
   } catch {
     return false;
   }
 }
 
-function isC4WebPageUrl(url) {
-  return typeof url === "string" && /^https:\/\/c4web\.c4mix\.com(?:[/?#]|$)/.test(url);
+function normalizeStoredIngestUrl(url) {
+  if (typeof url !== "string" || !url.trim()) return null;
+  try {
+    const parsed = new URL(url.trim());
+    if (
+      parsed.origin !== "https://rainbowlab.ai.kr" ||
+      parsed.pathname !== "/ingest/batch"
+    ) return null;
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+}
+
+function normalizeStoredRuntimeConfigUrl(url) {
+  if (typeof url !== "string" || !url.trim()) return null;
+  try {
+    const parsed = new URL(url.trim());
+    if (
+      parsed.origin !== "https://rainbowlab.ai.kr" ||
+      parsed.pathname !== "/collector/runtime-config"
+    ) return null;
+    parsed.search = "";
+    parsed.hash = "";
+    return parsed.toString();
+  } catch {
+    return null;
+  }
 }
 
 function padDatePart(value, width = 2) {
   return String(value).padStart(width, "0");
 }
 
+const KST_OFFSET_MS = 9 * 60 * 60 * 1000;
+
 function toCollectorDateTime(value) {
   const parsed = new Date(value);
-  const date = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+  const sourceDate = Number.isNaN(parsed.getTime()) ? new Date() : parsed;
+  const date = new Date(sourceDate.getTime() + KST_OFFSET_MS);
   return [
     `${date.getUTCFullYear()}-${padDatePart(date.getUTCMonth() + 1)}-${padDatePart(date.getUTCDate())}`,
     `${padDatePart(date.getUTCHours())}:${padDatePart(date.getUTCMinutes())}:${padDatePart(date.getUTCSeconds())}.${padDatePart(date.getUTCMilliseconds(), 3)}`
@@ -124,8 +234,10 @@ function toJsonSafeString(value) {
 
 function toUrlPath(value) {
   if (typeof value !== "string" || !value.trim()) return null;
+  const trimmed = value.trim();
+  if (trimmed.startsWith("/")) return trimmed.split(/[?#]/, 1)[0] || "/";
   try {
-    return new URL(value).pathname || "/";
+    return new URL(trimmed).pathname || "/";
   } catch {
     return null;
   }
@@ -190,15 +302,27 @@ function normalizeRowForCollector(row, ingestUrl) {
     payload.api_context && typeof payload.api_context === "object" ? payload.api_context : {};
   const relationContext =
     payload.relation_context && typeof payload.relation_context === "object" ? payload.relation_context : null;
+  const eventContext =
+    payload.event_context && typeof payload.event_context === "object" ? payload.event_context : null;
   const inputContext =
     payload.input_context && typeof payload.input_context === "object" ? payload.input_context : {};
   const menuContext =
     payload.menu_context && typeof payload.menu_context === "object" ? payload.menu_context : null;
   const uiOutcome =
     payload.ui_outcome && typeof payload.ui_outcome === "object" ? payload.ui_outcome : null;
+  const gridContext =
+    payload.grid_context && typeof payload.grid_context === "object" ? payload.grid_context : null;
+  const gridCellClick =
+    payload.grid_cell_click && typeof payload.grid_cell_click === "object" ? payload.grid_cell_click : null;
+  const popupContext =
+    payload.popup_context && typeof payload.popup_context === "object" ? payload.popup_context : null;
 
   const action = typeof row.action === "string" && row.action.trim() ? row.action.trim() : "change";
-  const eventTime = toCollectorDateTime(row.event_time);
+  const rawEventTime =
+    typeof row.event_time === "string" && row.event_time.trim()
+      ? row.event_time
+      : new Date().toISOString();
+  const eventTime = toCollectorDateTime(rawEventTime);
   const pageUrl =
     typeof row.page_url === "string" && row.page_url.trim()
       ? row.page_url
@@ -214,7 +338,7 @@ function normalizeRowForCollector(row, ingestUrl) {
   return {
     AZ_event_id: typeof row.event_id === "string" && row.event_id.trim() ? row.event_id : null,
     AZ_event_time: eventTime,
-    AZ_event_ts_ms: toEventTimestampMs(eventTime),
+    AZ_event_ts_ms: toEventTimestampMs(rawEventTime),
     AZ_event_action: action,
     AZ_event_subtype: typeof payload.kind === "string" && payload.kind.trim() ? payload.kind : null,
     AZ_login_id: loginId,
@@ -250,8 +374,12 @@ function normalizeRowForCollector(row, ingestUrl) {
       element: toJsonSafeObject(elementContext),
       input_context: toJsonSafeObject(inputContext),
       api_context: toJsonSafeObject(apiContext),
+      event_context: toJsonSafeObject(eventContext),
       relation_context: toJsonSafeObject(relationContext),
       menu_context: toJsonSafeObject(menuContext),
+      grid_context: toJsonSafeObject(gridContext),
+      grid_cell_click: toJsonSafeObject(gridCellClick),
+      popup_context: toJsonSafeObject(popupContext),
       ui_outcome: toJsonSafeObject(uiOutcome),
       analysis: {
         event_sequence: row.event_sequence ?? null,
@@ -270,6 +398,7 @@ function normalizeRowForCollector(row, ingestUrl) {
       },
       raw_payload: toJsonSafeObject(payload)
     },
+    AZ_snapshot_dom_after: row.snapshot ?? null,
     snapshot: row.snapshot ?? null
   };
 }
@@ -325,7 +454,8 @@ function buildQueueOverflowDiagnosticRow(droppedRowsCount) {
       },
       overflow_context: {
         dropped_rows_count: droppedRowsCount,
-        max_queue_rows: MAX_QUEUE_ROWS,
+        soft_max_queue_rows: MAX_QUEUE_ROWS,
+        hard_max_queue_rows: QUEUE_HARD_MAX_ROWS,
         reason: "background_queue_overflow"
       },
       legacy: {}
@@ -334,8 +464,9 @@ function buildQueueOverflowDiagnosticRow(droppedRowsCount) {
 }
 
 function truncateQueueToMax() {
-  if (pendingRows.length <= MAX_QUEUE_ROWS) return;
-  const overflow = pendingRows.length - MAX_QUEUE_ROWS;
+  if (pendingRows.length <= QUEUE_HARD_MAX_ROWS) return;
+  scheduleUpload(0, "큐가 하드 한도를 넘어 누락 방지를 위해 즉시 서버 전송");
+  const overflow = pendingRows.length - QUEUE_HARD_MAX_ROWS;
   const existingDiagnostic = pendingRows.find((row) =>
     row?.action === "queue_overflow" &&
     row?.payload?.overflow_context?.reason === "background_queue_overflow"
@@ -351,17 +482,25 @@ function truncateQueueToMax() {
         ...(existingDiagnostic.payload?.overflow_context || {}),
         dropped_rows_count:
           Number(existingDiagnostic.payload?.overflow_context?.dropped_rows_count || 0) + droppedRowsCount,
-        max_queue_rows: MAX_QUEUE_ROWS,
+        soft_max_queue_rows: MAX_QUEUE_ROWS,
+        hard_max_queue_rows: QUEUE_HARD_MAX_ROWS,
         reason: "background_queue_overflow"
       }
     };
   } else if (droppedRowsCount > 0) {
     pendingRows.push(buildQueueOverflowDiagnosticRow(droppedRowsCount));
   }
-  while (pendingRows.length > MAX_QUEUE_ROWS) {
+  while (pendingRows.length > QUEUE_HARD_MAX_ROWS) {
     pendingRows.shift();
   }
-  console.warn(`[AZ_TEST] queue truncated by ${droppedRowsCount} rows to respect MAX_QUEUE_ROWS=${MAX_QUEUE_ROWS}`);
+  console.warn("[Rainbow Collector] 큐 하드 한도 초과로 오래된 데이터를 일부 제거", {
+    "제거 row 수": droppedRowsCount,
+    "전송 시작 기준 row 수": QUEUE_URGENT_FLUSH_ROWS,
+    "소프트 최대 row 수": MAX_QUEUE_ROWS,
+    "하드 최대 row 수": QUEUE_HARD_MAX_ROWS,
+    "이유": "서버 전송 실패 또는 네트워크 지연이 계속되어 브라우저 저장소 보호용 최후 안전장치가 작동함",
+    "정상 기준": "이 로그는 자주 나오면 안 되며, 보통은 하드 한도 도달 전에 즉시 전송됩니다"
+  });
 }
 
 function estimateBatchBytes(rows) {
@@ -402,10 +541,7 @@ async function readCollectorConfig() {
   ]);
 
   return {
-    collectorIngestUrl:
-      typeof stored?.[COLLECTOR_INGEST_URL_KEY] === "string" && stored[COLLECTOR_INGEST_URL_KEY].trim()
-        ? stored[COLLECTOR_INGEST_URL_KEY].trim()
-        : null,
+    collectorIngestUrl: normalizeStoredIngestUrl(stored?.[COLLECTOR_INGEST_URL_KEY]),
     tenantId:
       typeof stored?.[TENANT_ID_KEY] === "string" && stored[TENANT_ID_KEY].trim()
         ? stored[TENANT_ID_KEY].trim()
@@ -414,21 +550,8 @@ async function readCollectorConfig() {
       typeof stored?.[COLLECTOR_KEY_KEY] === "string" && stored[COLLECTOR_KEY_KEY].trim()
         ? stored[COLLECTOR_KEY_KEY].trim()
         : "",
-    collectorRuntimeConfigUrl:
-      typeof stored?.[RUNTIME_CONFIG_URL_KEY] === "string" && stored[RUNTIME_CONFIG_URL_KEY].trim()
-        ? stored[RUNTIME_CONFIG_URL_KEY].trim()
-        : null
+    collectorRuntimeConfigUrl: normalizeStoredRuntimeConfigUrl(stored?.[RUNTIME_CONFIG_URL_KEY])
   };
-}
-
-function isDevelopmentCollectorUrl(url) {
-  if (typeof url !== "string") return false;
-  try {
-    const parsed = new URL(url);
-    return parsed.hostname === "localhost" || parsed.hostname === "127.0.0.1";
-  } catch {
-    return false;
-  }
 }
 
 async function injectCollectorScript(tabId) {
@@ -439,7 +562,10 @@ async function injectCollectorScript(tabId) {
       files: ["content.js"]
     });
   } catch (error) {
-    console.warn("[AZ_TEST] content injection failed", error);
+    console.warn("[Rainbow Collector] content script 주입 실패", {
+      "실패 이유": error?.message || String(error),
+      "영향": "이 탭/프레임에서는 이벤트 수집이 시작되지 않을 수 있음"
+    });
   }
 }
 
@@ -464,25 +590,60 @@ async function persistQueue() {
   await chrome.storage.local.set({ [QUEUE_KEY]: pendingRows });
 }
 
+function hasImmediateFlushRow(rows) {
+  return rows.some((row) => row?.action === "page_close");
+}
+
 async function enqueueRows(rows) {
   if (!Array.isArray(rows) || rows.length === 0) return;
   await hydrateQueue();
   pendingRows.push(...rows);
+  const hasImmediateRow = hasImmediateFlushRow(rows);
+  const shouldFlushImmediately = hasImmediateRow || pendingRows.length >= QUEUE_URGENT_FLUSH_ROWS;
+  if (shouldFlushImmediately) {
+    console.info("[Rainbow Collector] 즉시 서버 전송을 시작합니다", {
+      "현재 대기 row 수": pendingRows.length,
+      "즉시 전송 기준 row 수": QUEUE_URGENT_FLUSH_ROWS,
+      "소프트 최대 row 수": MAX_QUEUE_ROWS,
+      "이유": hasImmediateRow
+        ? "page_close 이벤트는 탭 종료 전 누락 방지를 위해 바로 서버로 보냄"
+        : "큐가 최대치에 가까워져 누락 위험을 줄이기 위해 바로 서버로 보냄"
+    });
+  }
   truncateQueueToMax();
   await persistQueue();
-  scheduleUpload();
+  scheduleUpload(
+    shouldFlushImmediately ? 0 : BASE_UPLOAD_DELAY_MS,
+    shouldFlushImmediately
+      ? (hasImmediateRow
+        ? "page_close 이벤트 누락 방지를 위해 즉시 서버 전송"
+        : "큐가 최대치에 가까워져 누락 방지를 위해 즉시 서버 전송")
+      : "content script가 전달한 수집 데이터를 idle batch로 서버 전송",
+    { debounce: !shouldFlushImmediately }
+  );
 }
 
-function scheduleUpload(delayMs = BASE_UPLOAD_DELAY_MS) {
+function scheduleUpload(delayMs = BASE_UPLOAD_DELAY_MS, reason = "전송 대기 중인 데이터를 서버로 전송", options = {}) {
+  if (reason) scheduledUploadReason = reason;
   if (uploadInFlight) {
     flushRequestedWhileInFlight = true;
     return;
   }
-  if (uploadTimer) return;
+  const normalizedDelayMs = Math.max(0, delayMs);
+  const shouldDebounce = Boolean(options.debounce) && normalizedDelayMs > 0;
+  if (uploadTimer) {
+    const canReplaceTimer = normalizedDelayMs === 0 || (shouldDebounce && uploadTimerIsDebounceable);
+    if (!canReplaceTimer) return;
+    clearTimeout(uploadTimer);
+    uploadTimer = null;
+    uploadTimerIsDebounceable = false;
+  }
+  uploadTimerIsDebounceable = shouldDebounce;
   uploadTimer = setTimeout(() => {
     uploadTimer = null;
+    uploadTimerIsDebounceable = false;
     void flushUpload();
-  }, Math.max(0, delayMs));
+  }, normalizedDelayMs);
 }
 
 async function ensureQueueFlushAlarm() {
@@ -492,33 +653,35 @@ async function ensureQueueFlushAlarm() {
       periodInMinutes: QUEUE_FLUSH_ALARM_PERIOD_MINUTES
     });
   } catch (error) {
-    console.warn("[AZ_TEST] queue flush alarm setup failed", error);
+    console.warn("[Rainbow Collector] 큐 재전송 알람 설정 실패", {
+      "실패 이유": error?.message || String(error),
+      "영향": "브라우저가 idle 상태일 때 큐 재전송이 늦어질 수 있음"
+    });
   }
 }
 
 async function wakeQueueFlush(reason = "alarm") {
   await hydrateQueue();
   if (pendingRows.length === 0) return;
-  console.info("[AZ_TEST] queue flush wake", { reason, pendingRows: pendingRows.length });
-  scheduleUpload(0);
+  const readableReason =
+    reason === "alarm"
+      ? "주기 알람이 깨어나 이전에 쌓인 큐 데이터를 다시 전송"
+      : reason === "runtime_startup"
+        ? "브라우저/서비스워커 시작 후 남아 있던 큐 데이터를 전송"
+        : reason === "runtime_installed"
+          ? "확장 설치/리로드 후 남아 있던 큐 데이터를 전송"
+          : `${reason} 사유로 남아 있던 큐 데이터를 전송`;
+  console.info("[Rainbow Collector] 큐 재전송 대기", {
+    "이유": readableReason,
+    "대기 row 수": pendingRows.length
+  });
+  scheduleUpload(0, readableReason);
 }
 
 function resolveIngestUrl(rows, config) {
-  const sourcePageUrl = firstSourcePageUrl(rows);
-  if (isC4WebPageUrl(sourcePageUrl)) {
-    return DEFAULT_INGEST_URL;
-  }
-
   if (config?.collectorIngestUrl) {
     return config.collectorIngestUrl;
   }
-
-  if (typeof sourcePageUrl === "string" && isDevelopmentCollectorUrl(sourcePageUrl)) {
-    try {
-      return new URL("/ingest/batch", sourcePageUrl).toString();
-    } catch {}
-  }
-
   return DEFAULT_INGEST_URL;
 }
 
@@ -631,17 +794,31 @@ async function readRuntimeConfigForPage(pageUrl = null) {
   }
 }
 
-function debugLogUploadPayload(ingestUrl, sourceRows, payload) {
+function debugLogUploadPayload(ingestUrl, sourceRows, payload, context = {}) {
   if (!DEBUG_LOG_ALL_UPLOAD_PAYLOADS) return;
   try {
     const rowCount = Array.isArray(payload?.rows) ? payload.rows.length : 0;
-    console.groupCollapsed(`[collector-debug] background->ingest rows=${rowCount}`);
-    console.log("ingestUrl", ingestUrl);
-    console.log("sourceRows", sourceRows);
-    console.log("payload", payload);
+    const summary = summarizeRowsForConsole(sourceRows);
+    const reason = context.reason || summary.reason;
+    console.groupCollapsed(`[Rainbow Collector] 서버 전송 rows=${rowCount} · ${reason}`);
+    console.log("요약", {
+      "서버 전송 트리거": reason,
+      "전송된 데이터 종류": summary.reason,
+      "이벤트 종류별 개수": summary.actionCounts,
+      "전송 대상": ingestUrl,
+      "큐 상태": {
+        "전송 전 대기 row 수": context.pendingBefore ?? null,
+        "이번 전송 row 수": rowCount,
+        "최대 batch row 수": MAX_BATCH_ROWS,
+        "재시도 횟수": retryAttempt
+      },
+      "대표 이벤트": summary.preview
+    });
+    console.log("원본 rows", sourceRows);
+    console.log("서버 전송 payload", payload);
     console.groupEnd();
   } catch (error) {
-    console.log("[collector-debug] upload payload", { ingestUrl, sourceRows, payload });
+    console.log("[Rainbow Collector] 서버 전송 payload", { ingestUrl, sourceRows, payload, context });
   }
 }
 
@@ -651,13 +828,15 @@ async function flushUpload() {
 
   uploadInFlight = true;
   flushRequestedWhileInFlight = false;
+  const uploadReason = scheduledUploadReason || "전송 대기 중인 데이터를 서버로 전송";
+  scheduledUploadReason = "전송 대기 중인 데이터를 서버로 전송";
+  const pendingBefore = pendingRows.length;
   const rows = takeUploadBatch();
   const config = await readCollectorConfig();
   const ingestUrl = resolveIngestUrl(rows, config);
   const uploadRows = normalizeRowsForUpload(rows, ingestUrl);
-  const sourcePageUrl = firstSourcePageUrl(rows);
   const collectorKey =
-    isC4WebPageUrl(sourcePageUrl) || isProdCollectorUrl(ingestUrl)
+    isProdCollectorUrl(ingestUrl)
       ? DEFAULT_PROD_COLLECTOR_KEY
       : (config.collectorKey || "");
   let shouldContinue = false;
@@ -667,7 +846,10 @@ async function flushUpload() {
     if (uploadRows.length === 0) return;
 
     const uploadPayload = { rows: uploadRows, ts: Date.now() };
-    debugLogUploadPayload(ingestUrl, rows, uploadPayload);
+    debugLogUploadPayload(ingestUrl, rows, uploadPayload, {
+      reason: uploadReason,
+      pendingBefore
+    });
 
     const response = await fetch(ingestUrl, {
       method: "POST",
@@ -691,19 +873,36 @@ async function flushUpload() {
     await persistQueue();
     retryAttempt = 0;
     shouldContinue = pendingRows.length > 0;
+    if (DEBUG_LOG_ALL_UPLOAD_PAYLOADS) {
+      console.info("[Rainbow Collector] 서버 전송 성공", {
+        "전송 row 수": uploadRows.length,
+        "남은 큐 row 수": pendingRows.length,
+        "전송 대상": ingestUrl
+      });
+    }
   } catch (error) {
-    console.warn("[AZ_TEST] ingest retry scheduled", error);
     retryAttempt += 1;
     retryDelay = computeRetryDelay(retryAttempt);
+    console.warn("[Rainbow Collector] 서버 전송 실패 · 큐에 보관 후 재시도 대기", {
+      "실패 이유": error?.message || String(error),
+      "이번 전송 row 수": rows.length,
+      "큐에 남은 row 수": pendingRows.length,
+      "재시도 횟수": retryAttempt,
+      "다음 재시도 대기 ms": retryDelay,
+      "전송 대상": ingestUrl
+    });
   } finally {
     uploadInFlight = false;
     if (retryDelay != null) {
-      scheduleUpload(retryDelay);
+      scheduleUpload(retryDelay, "서버 전송 실패로 큐에 보관된 데이터를 재시도");
       return;
     }
     if (shouldContinue || flushRequestedWhileInFlight) {
+      const nextReason = shouldContinue
+        ? "batch 제한 때문에 남은 큐 데이터를 이어서 전송"
+        : "전송 중 새 데이터가 들어와 이어서 전송";
       flushRequestedWhileInFlight = false;
-      scheduleUpload(0);
+      scheduleUpload(0, nextReason);
     }
   }
 }
@@ -745,6 +944,479 @@ function installMainWorldBridge(bridgeNonce) {
       body_capture_skip_reason: "internal_collector_endpoint"
     };
   };
+
+  const normalizeCprText = (value) =>
+    String(value ?? "").replace(/\s+/g, " ").trim();
+
+  const splitCprPath = (value) => {
+    const values = Array.isArray(value) ? value : [value];
+    const parts = [];
+    for (const item of values) {
+      for (const part of String(item ?? "").split(/\s*(?:>|›|»)\s*/)) {
+        const text = normalizeCprText(part);
+        if (text && parts[parts.length - 1] !== text) parts.push(text);
+      }
+    }
+    return parts;
+  };
+
+  const readCprValue = (row, key, ds, index) => {
+    const keys = [key, String(key || "").toLowerCase(), String(key || "").toUpperCase()];
+    for (const candidateKey of keys) {
+      try {
+        if (row && Object.prototype.hasOwnProperty.call(row, candidateKey)) return row[candidateKey];
+      } catch {}
+      try {
+        if (row && typeof row.getValue === "function") {
+          const value = row.getValue(candidateKey);
+          if (value != null) return value;
+        }
+      } catch {}
+      try {
+        if (ds && typeof ds.getValue === "function") {
+          const value = ds.getValue(index, candidateKey);
+          if (value != null) return value;
+        }
+      } catch {}
+    }
+    return null;
+  };
+
+  const cprRowCount = (ds) => {
+    for (const method of ["getRowCount", "getRowCnt", "getLength"]) {
+      try {
+        if (typeof ds?.[method] === "function") {
+          const count = Number(ds[method]());
+          if (Number.isFinite(count)) return count;
+        }
+      } catch {}
+    }
+    if (Array.isArray(ds?._data)) return ds._data.length;
+    if (Array.isArray(ds?.data)) return ds.data.length;
+    return 0;
+  };
+
+  const cprRowData = (ds, index) => {
+    for (const method of ["getRowData", "getRow", "getRowState"]) {
+      try {
+        if (typeof ds?.[method] === "function") {
+          const row = ds[method](index);
+          if (row && typeof row === "object") return row;
+        }
+      } catch {}
+    }
+    if (Array.isArray(ds?._data)) return ds._data[index] || null;
+    if (Array.isArray(ds?.data)) return ds.data[index] || null;
+    return null;
+  };
+
+  const cprDatasetRows = (ds, maxRows = 3000) => {
+    const count = Math.min(cprRowCount(ds), maxRows);
+    const rows = [];
+    for (let index = 0; index < count; index += 1) {
+      const row = cprRowData(ds, index) || {};
+      rows.push({
+        index,
+        MENU_ID: normalizeCprText(readCprValue(row, "MENU_ID", ds, index)),
+        MENU_NM: normalizeCprText(readCprValue(row, "MENU_NM", ds, index)),
+        UMENU_ID: normalizeCprText(readCprValue(row, "UMENU_ID", ds, index)),
+        TOP_MENU_ID: normalizeCprText(readCprValue(row, "TOP_MENU_ID", ds, index)),
+        CALL_PAGE: normalizeCprText(readCprValue(row, "CALL_PAGE", ds, index)),
+        UNIT_SYSTEM_RCD: normalizeCprText(readCprValue(row, "UNIT_SYSTEM_RCD", ds, index)),
+        PGM_ID: normalizeCprText(readCprValue(row, "PGM_ID", ds, index)),
+        UPGM_ID: normalizeCprText(readCprValue(row, "UPGM_ID", ds, index)),
+        MENU_KEY: normalizeCprText(readCprValue(row, "MENU_KEY", ds, index)),
+        WRK_ARA_RCD: normalizeCprText(readCprValue(row, "WRK_ARA_RCD", ds, index)),
+        MENU_PATH: normalizeCprText(readCprValue(row, "MENU_PATH", ds, index))
+      });
+    }
+    return rows;
+  };
+
+  const lookupCprControl = (app, id) => {
+    try {
+      if (app && typeof app.lookup === "function") return app.lookup(id);
+    } catch {}
+    return null;
+  };
+
+  const findCprMainApp = () => {
+    const platform = window.cpr?.core?.Platform?.INSTANCE || null;
+    try {
+      const running = typeof platform?.getAllRunningAppInstances === "function"
+        ? platform.getAllRunningAppInstances()
+        : [];
+      const matched = running.find((app) =>
+        app &&
+        typeof app.lookup === "function" &&
+        (
+          app.id === "app/com/inc/main" ||
+          String(app.id || "").startsWith("app/com/inc/main$") ||
+          app.app?.id === "app/com/inc/main"
+        )
+      );
+      if (matched) return matched;
+    } catch {}
+
+    if (typeof platform?.lookup === "function") {
+      for (const id of ["app/com/inc/main$1", "app/com/inc/main", "com/inc/main"]) {
+        try {
+          const app = platform.lookup(id);
+          if (app && typeof app.lookup === "function") return app;
+        } catch {}
+      }
+    }
+    return null;
+  };
+
+  const readCprObjectAttr = (obj, names) => {
+    if (!obj) return null;
+    for (const name of names) {
+      for (const method of ["getUserAttribute", "getUserAttr", "userAttr", "getAttr", "attr"]) {
+        try {
+          if (typeof obj[method] === "function") {
+            const value = obj[method](name);
+            if (value != null && normalizeCprText(value)) return value;
+          }
+        } catch {}
+      }
+      try {
+        if (Object.prototype.hasOwnProperty.call(obj, name)) return obj[name];
+      } catch {}
+      try {
+        if (obj.userAttrs && Object.prototype.hasOwnProperty.call(obj.userAttrs, name)) return obj.userAttrs[name];
+      } catch {}
+    }
+    return null;
+  };
+
+  const collectCprSelectedHints = (mainApp) => {
+    const hints = [];
+    const addHint = (value) => {
+      const text = normalizeCprText(value);
+      if (text && !hints.includes(text)) hints.push(text);
+    };
+    try {
+      const running = window.cpr?.core?.Platform?.INSTANCE?.getAllRunningAppInstances?.() || [];
+      const businessApps = running
+        .map((app) => app?.app?.id || app?.id || null)
+        .map((id) => normalizeCprText(String(id || "").replace(/\$\d+$/, "")))
+        .filter((id) =>
+          id.startsWith("app/") &&
+          !id.startsWith("app/com/") &&
+          !id.startsWith("app/cmn/") &&
+          !id.startsWith("udc/")
+        );
+      for (const id of businessApps.slice().reverse()) {
+        addHint(id);
+        addHint(id.replace(/\.clx$/i, ""));
+      }
+    } catch {}
+    const mdi = lookupCprControl(mainApp, "mdiCn");
+    const selectedCandidates = [];
+    for (const method of ["getSelectedTabItem", "getSelectedItem", "getSelectedTab", "getSelection", "getSelectedAppInstance"]) {
+      try {
+        if (typeof mdi?.[method] === "function") {
+          const value = mdi[method]();
+          if (Array.isArray(value)) selectedCandidates.push(...value);
+          else if (value) selectedCandidates.push(value);
+        }
+      } catch {}
+    }
+    for (const selected of selectedCandidates) {
+      addHint(readCprObjectAttr(selected, [
+        "MENU_ID", "menu_id", "menuId", "PGM_ID", "pgm_id", "program_id",
+        "appId", "APP_ID", "id", "value", "text", "label"
+      ]));
+      addHint(selected?.text || selected?.label || selected?.value || selected?.id);
+      addHint(readCprObjectAttr(selected?.content, [
+        "MENU_ID", "menu_id", "menuId", "PGM_ID", "pgm_id", "program_id",
+        "appId", "APP_ID", "id"
+      ]));
+      addHint(selected?.content?.app?.id || selected?.content?.id);
+    }
+    for (const selector of [
+      "[aria-selected='true']",
+      ".cl-selected",
+      ".cl-selected-item",
+      ".cl-focus",
+      ".selected",
+      ".active"
+    ]) {
+      try {
+        for (const el of document.querySelectorAll(selector)) {
+          addHint(el.getAttribute("data-menu-id"));
+          addHint(el.getAttribute("data-pgm-id"));
+          addHint(el.getAttribute("data-app-id"));
+          addHint(el.id);
+          addHint(el.textContent);
+        }
+      } catch {}
+    }
+    return hints.slice(0, 30);
+  };
+
+  const compactCprKey = (value) =>
+    normalizeCprText(value).toLowerCase().replace(/[^a-z0-9가-힣]/g, "");
+
+  const cprApiHints = (apiUrl) => {
+    const hints = [];
+    const addHint = (value) => {
+      const text = normalizeCprText(value).replace(/\.do$/i, "");
+      if (!text) return;
+      if (/^(sys|cmn|apc|ccr|csr|cgd|org|tdr|itest|collector|onLoad|list|listDtl|save|delete|insert|update|get|find)$/i.test(text)) return;
+      if (text.length < 5) return;
+      hints.push(text);
+      const programMatch = text.match(/^((?:Ext|Std)[A-Z][A-Za-z0-9]{2})([A-Z].+)$/);
+      if (programMatch?.[1] && programMatch?.[2]) {
+        hints.push(`${programMatch[1]}C${programMatch[2]}`);
+        hints.push(`${programMatch[1]}S${programMatch[2]}`);
+      }
+    };
+    try {
+      const path = new URL(String(apiUrl || ""), location.href).pathname || "";
+      const parts = path.split("/").map((part) => normalizeCprText(part)).filter(Boolean);
+      for (const part of parts) {
+        addHint(part);
+      }
+      const programMatch = path.match(/\/([A-Za-z][A-Za-z0-9]+)\/(?:onLoad|list|listDtl|save|delete|insert|update|get|find)[A-Za-z0-9]*\.do$/i);
+      if (programMatch?.[1]) {
+        const before = hints.length;
+        addHint(programMatch[1]);
+        if (hints.length > before) {
+          const added = hints.splice(before);
+          hints.unshift(...added);
+        }
+      }
+    } catch {}
+    return hints.filter(Boolean);
+  };
+
+  const findCprMenuRow = (rows, hints) => {
+    const compactHints = hints.map(compactCprKey).filter(Boolean);
+    if (!compactHints.length) return null;
+    for (const hint of compactHints) {
+      const matched = rows.find((row) => {
+        const values = [
+          row.MENU_ID,
+          row.PGM_ID,
+          row.MENU_KEY,
+          row.CALL_PAGE,
+          row.MENU_NM
+        ].map(compactCprKey).filter(Boolean);
+        return values.some((value) => value === hint || value.includes(hint) || hint.includes(value));
+      });
+      if (matched) return matched;
+    }
+    return null;
+  };
+
+  const collectCprMenuContext = (detail = {}) => {
+    const mainApp = findCprMainApp();
+    if (!mainApp) return null;
+    const dsAllMenu = lookupCprControl(mainApp, "dsAllMenu");
+    if (!dsAllMenu) return null;
+    const rows = cprDatasetRows(dsAllMenu);
+    if (!rows.length) return null;
+
+    const explicitHints = [
+      detail.menu_id,
+      detail.menuId,
+      detail.program_id,
+      detail.programId,
+      detail.pgm_id,
+      detail.PGM_ID,
+      ...cprApiHints(detail.api_url)
+    ].filter(Boolean);
+    const selectedHints = collectCprSelectedHints(mainApp);
+    const menuRow = findCprMenuRow(rows, [...explicitHints, ...selectedHints]);
+    if (!menuRow) {
+      return {
+        source: "cpr_runtime",
+        parser: "cpr_dsAllMenu_mdi",
+        capture_status: "unresolved",
+        confidence: 0.35,
+        warnings: ["cpr_menu_row_unresolved"],
+        selected_hints: selectedHints.slice(0, 8)
+      };
+    }
+
+    const miniRows = cprDatasetRows(lookupCprControl(mainApp, "dsMiniMenu"), 100);
+    const topMenu = miniRows.find((row) => row.MENU_ID && row.MENU_ID === menuRow.TOP_MENU_ID) || null;
+    const path = splitCprPath(menuRow.MENU_PATH);
+    if (topMenu?.MENU_NM && path[0] !== topMenu.MENU_NM) path.unshift(topMenu.MENU_NM);
+    if (!path.length && menuRow.MENU_NM) path.push(menuRow.MENU_NM);
+
+    return {
+      source: "cpr_runtime",
+      parser: "cpr_dsAllMenu_mdi",
+      path,
+      path_text: path.join(" > "),
+      selected_path: path,
+      selected_path_text: path.join(" > "),
+      selected_label: menuRow.MENU_NM || path[path.length - 1] || null,
+      menu_id: menuRow.MENU_ID || null,
+      program_id: menuRow.PGM_ID || null,
+      call_page: menuRow.CALL_PAGE || null,
+      top_menu_id: menuRow.TOP_MENU_ID || null,
+      unit_system_rcd: menuRow.UNIT_SYSTEM_RCD || null,
+      wrk_ara_rcd: menuRow.WRK_ARA_RCD || null,
+      menu_key: menuRow.MENU_KEY || null,
+      depth: path.length || null,
+      confidence: path.length >= 2 ? 0.98 : 0.8,
+      capture_status: path.length >= 2 ? "complete" : "partial",
+      warnings: path.length >= 2 ? [] : ["cpr_menu_path_shallow"]
+    };
+  };
+
+  const cprPrimitive = (value) => {
+    if (value == null) return null;
+    if (["string", "number", "boolean"].includes(typeof value)) return value;
+    if (value instanceof Date) return value.toISOString();
+    return normalizeCprText(value);
+  };
+
+  const cprDataRowMap = (ds, rowIndex, maxColumns = 30) => {
+    if (!ds || !Number.isInteger(rowIndex) || rowIndex < 0) return null;
+    let columns = [];
+    try {
+      columns = ds.getColumnNames?.() || [];
+    } catch {}
+    const row = {};
+    for (const column of columns.slice(0, maxColumns)) {
+      try {
+        row[column] = cprPrimitive(ds.getValue?.(rowIndex, column));
+      } catch {}
+    }
+    return Object.keys(row).length > 0 ? row : null;
+  };
+
+  const collectCprGridContextNow = (detail = {}) => {
+    const point = detail.point && Number.isFinite(Number(detail.point.x)) && Number.isFinite(Number(detail.point.y))
+      ? { x: Number(detail.point.x), y: Number(detail.point.y) }
+      : null;
+    const targetHint = detail.targetHint && typeof detail.targetHint === "object" ? detail.targetHint : {};
+    const hintedText = `${targetHint.id || ""} ${targetHint.selector || ""}`;
+    const hintedUuid = hintedText.match(/(?:^|#)uuid-([A-Za-z0-9_-]+)/)?.[1] || null;
+    const pointElement = point ? document.elementFromPoint(point.x, point.y) : null;
+    const candidates = [];
+
+    for (const app of window.cpr?.core?.Platform?.INSTANCE?.getAllRunningAppInstances?.() || []) {
+      let controls = [];
+      try {
+        const container = app.getContainer?.();
+        controls = container?.getAllRecursiveChildren?.() || container?.getChildren?.() || [];
+      } catch {}
+      for (const grid of controls) {
+        if (String(grid?.type || "").toLowerCase() !== "grid") continue;
+        const uuid = normalizeCprText(grid.uuid || grid.getUUID?.());
+        const root = uuid ? document.getElementById(`uuid-${uuid}`) : null;
+        const rect = root?.getBoundingClientRect?.() || null;
+        if (!root || !rect || rect.width <= 0 || rect.height <= 0) continue;
+        let score = 0;
+        if (hintedUuid && hintedUuid === uuid) score += 100;
+        if (point && point.x >= rect.left && point.x <= rect.right && point.y >= rect.top && point.y <= rect.bottom) score += 60;
+        if (pointElement && root.contains(pointElement)) score += 80;
+        if (targetHint.id && root.id === targetHint.id) score += 100;
+        if (score <= 0) continue;
+        candidates.push({ app, grid, root, rect, uuid, score });
+      }
+    }
+
+      const selected = candidates.sort((a, b) => b.score - a.score)[0] || null;
+      if (!selected) return null;
+      const { app, grid, root, uuid } = selected;
+      const ds = grid.dataSet || grid.getDataSet?.() || null;
+      const gridCellSelector = "[role='gridcell'],[role='cell']";
+      const pointCell = point
+        ? (document.elementsFromPoint?.(point.x, point.y) || [])
+            .map((element) => element?.closest?.(gridCellSelector) || null)
+            .find((candidate) => candidate && root.contains(candidate)) || null
+        : null;
+      const boundsCell = point
+        ? [...root.querySelectorAll(gridCellSelector)].find((candidate) => {
+            const bounds = candidate.getBoundingClientRect?.();
+            return bounds && point.x >= bounds.left && point.x <= bounds.right && point.y >= bounds.top && point.y <= bounds.bottom;
+          }) || null
+        : null;
+      const cell = pointCell || boundsCell || pointElement?.closest?.(gridCellSelector) || null;
+      const domRow = cell?.closest?.("[role='row']") || null;
+    const dataRows = [...root.querySelectorAll("[role='row']")]
+      .filter((row) => row.querySelector("[role='gridcell'],[role='cell']"));
+    const rowCells = domRow ? [...domRow.querySelectorAll("[role='gridcell'],[role='cell']")] : [];
+
+    let rowIndex = null;
+    try {
+      const value = Number(grid.getSelectedRowIndex?.());
+      if (Number.isInteger(value) && value >= 0) rowIndex = value;
+    } catch {}
+    if (rowIndex == null && domRow) {
+      const ariaRow = Number(domRow.getAttribute("aria-rowindex"));
+      rowIndex = Number.isInteger(ariaRow) && ariaRow > 0 ? ariaRow - 1 : dataRows.indexOf(domRow);
+    }
+
+      let colIndex = cell ? rowCells.indexOf(cell) : -1;
+      const ariaCol = Number(cell?.getAttribute?.("aria-colindex"));
+      if (Number.isInteger(ariaCol) && ariaCol > 0) colIndex = ariaCol - 1;
+      if (colIndex < 0) colIndex = null;
+
+      const rawModelColIndex = Number(cell?.getAttribute?.("data-cellindex"));
+      const modelColIndex = Number.isInteger(rawModelColIndex) && rawModelColIndex >= 0
+        ? rawModelColIndex
+        : colIndex;
+
+      let cellInfo = null;
+      try {
+        if (modelColIndex != null) cellInfo = grid.getCellInfo?.(modelColIndex) || null;
+      } catch {}
+    const headers = [...root.querySelectorAll("[role='columnheader']")]
+      .slice(0, 30)
+      .map((header) => normalizeCprText(header.innerText || header.textContent))
+      .filter(Boolean);
+    const columnId = normalizeCprText(cellInfo?.columnName || "") || null;
+    const columnLabel = colIndex != null ? headers[colIndex] || columnId : columnId;
+    const rowData = cprDataRowMap(ds, rowIndex, 30) || {};
+    if (columnId && !Object.prototype.hasOwnProperty.call(rowData, columnId)) {
+      try {
+        rowData[columnId] = cprPrimitive(ds?.getValue?.(rowIndex, columnId));
+      } catch {}
+    }
+      let cellValue = columnId ? rowData[columnId] : null;
+      if (cellValue == null && rowIndex != null && modelColIndex != null) {
+        try {
+          cellValue = cprPrimitive(grid.getCellValue?.(rowIndex, modelColIndex));
+        } catch {}
+      }
+    if (cellValue == null && cell) cellValue = normalizeCprText(cell.innerText || cell.textContent) || null;
+
+    return {
+      gridId: grid.id || root.id || null,
+      datasetId: ds?.id || null,
+      componentId: uuid ? `uuid-${uuid}` : root.id || null,
+        appId: app?.app?.id || app?.id || null,
+        rowIndex,
+        colIndex,
+        modelColIndex,
+        columnId,
+      columnLabel,
+      cellValue,
+      rawValue: cellValue,
+      headers,
+      rowContext: {
+        row_path: [],
+        row_label: null,
+        values: rowData,
+        map: rowData,
+        confidence: rowIndex != null && Object.keys(rowData).length > 0 ? 0.99 : 0.55,
+        capture_status: rowIndex != null && Object.keys(rowData).length > 0 ? "complete" : "partial",
+        warnings: rowIndex == null ? ["cpr_selected_row_unresolved"] : []
+      }
+    };
+  };
+
+  const collectCprGridContext = (detail = {}) => new Promise((resolve) => {
+    setTimeout(() => resolve(collectCprGridContextNow(detail)), 0);
+  });
 
   const postStateSnapshotFromCollector = (kind, requestId, collectorFn, detail) => {
     let raw = null;
@@ -825,7 +1497,44 @@ function installMainWorldBridge(bridgeNonce) {
     window.addEventListener("popstate", () => queueMicrotask(() => emitRouteChange("popstate")), true);
     window.addEventListener("hashchange", () => queueMicrotask(() => emitRouteChange("hashchange")), true);
   } catch (error) {
-    console.warn("[AZ_TEST] route hook failed", error);
+    console.warn("[Rainbow Collector] route_change 훅 설치 실패", {
+      "실패 이유": error?.message || String(error),
+      "영향": "pushState/replaceState 기반 화면 이동 일부가 수집되지 않을 수 있음"
+    });
+  }
+
+  let nativeDialogSequence = 0;
+  for (const dialogType of ["alert", "confirm", "prompt"]) {
+    const originalDialog = window[dialogType];
+    if (typeof originalDialog !== "function") continue;
+    window[dialogType] = function(message, ...args) {
+      nativeDialogSequence += 1;
+      const dialogId = `native-dialog:${Date.now()}:${nativeDialogSequence}`;
+      const openedAtMs = Date.now();
+      post("NATIVE_DIALOG_OPEN", {
+        dialogId,
+        dialogType,
+        message: normalizeCprText(message).slice(0, 1000),
+        observedAt: new Date(openedAtMs).toISOString(),
+        observedAtMs: openedAtMs
+      });
+      let result;
+      try {
+        result = originalDialog.call(window, message, ...args);
+        return result;
+      } finally {
+        const closedAtMs = Date.now();
+        post("NATIVE_DIALOG_CLOSE", {
+          dialogId,
+          dialogType,
+          message: normalizeCprText(message).slice(0, 1000),
+          accepted: dialogType === "confirm" ? result === true : null,
+          resultProvided: dialogType === "prompt" ? result != null : false,
+          observedAt: new Date(closedAtMs).toISOString(),
+          observedAtMs: closedAtMs
+        });
+      }
+    };
   }
 
   if (window.fetch) {
@@ -842,7 +1551,12 @@ function installMainWorldBridge(bridgeNonce) {
         url: String(request?.url || request || ""),
         method,
         startedAt: new Date(startedAtMs).toISOString(),
-        startedAtMs
+        startedAtMs,
+        cprMenuContext: collectCprMenuContext({
+          reason: "fetch_start",
+          api_url: String(request?.url || request || ""),
+          method
+        })
       });
       let response;
       try {
@@ -898,7 +1612,10 @@ function installMainWorldBridge(bridgeNonce) {
           }));
         }
       } catch (error) {
-        console.warn("[AZ_TEST] fetch hook failed", error);
+        console.warn("[Rainbow Collector] fetch response 훅 처리 실패", {
+          "실패 이유": error?.message || String(error),
+          "영향": "해당 fetch의 response 본문/상태 일부가 transaction에 반영되지 않을 수 있음"
+        });
       }
 
       return response;
@@ -930,7 +1647,12 @@ function installMainWorldBridge(bridgeNonce) {
       url: this.__az_test_url || "",
       method: this.__az_test_method || "GET",
       startedAt: new Date(this.__az_test_started_at_ms).toISOString(),
-      startedAtMs: this.__az_test_started_at_ms
+      startedAtMs: this.__az_test_started_at_ms,
+      cprMenuContext: collectCprMenuContext({
+        reason: "xhr_start",
+        api_url: this.__az_test_url || "",
+        method: this.__az_test_method || "GET"
+      })
     });
     const postXhrFailure = (eventType) => {
       try {
@@ -957,7 +1679,10 @@ function installMainWorldBridge(bridgeNonce) {
             null
         }));
       } catch (error) {
-        console.warn("[AZ_TEST] xhr error hook failed", error);
+        console.warn("[Rainbow Collector] XHR 실패 이벤트 훅 처리 실패", {
+          "실패 이유": error?.message || String(error),
+          "영향": "해당 XHR 실패 row가 누락될 수 있음"
+        });
       }
     };
 
@@ -995,7 +1720,10 @@ function installMainWorldBridge(bridgeNonce) {
             null
         }));
       } catch (error) {
-        console.warn("[AZ_TEST] xhr hook failed", error);
+        console.warn("[Rainbow Collector] XHR response 훅 처리 실패", {
+          "실패 이유": error?.message || String(error),
+          "영향": "해당 XHR response row가 누락되거나 불완전할 수 있음"
+        });
       }
     }, { once: true });
 
@@ -1033,8 +1761,16 @@ function installMainWorldBridge(bridgeNonce) {
       return;
     }
 
+    if (kind === "cpr_context") {
+      postStateSnapshotFromCollector(kind, requestId, collectCprMenuContext, event.detail || {});
+      return;
+    }
+
     if (kind === "exbuilder6") {
-      postStateSnapshotFromCollector(kind, requestId, window.__AZ_TEST_COLLECT_EXBUILDER6__, event.detail || {});
+      const collector = typeof window.__AZ_TEST_COLLECT_EXBUILDER6__ === "function"
+        ? window.__AZ_TEST_COLLECT_EXBUILDER6__
+        : collectCprGridContext;
+      postStateSnapshotFromCollector(kind, requestId, collector, event.detail || {});
     }
   });
 }
@@ -1078,7 +1814,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }).then(() => {
       sendResponse?.({ ok: true });
     }).catch((error) => {
-      console.warn("[AZ_TEST] bridge injection failed", error);
+      console.warn("[Rainbow Collector] main world 브리지 주입 실패", {
+        "실패 이유": error?.message || String(error),
+        "영향": "fetch/XHR/history 훅 또는 프레임 내부 수집 일부가 제한될 수 있음"
+      });
       sendResponse?.({ ok: false, error: String(error?.message || error) });
     });
     return true;
@@ -1114,6 +1853,6 @@ void ensureQueueFlushAlarm();
 
 void hydrateQueue().then(() => {
   if (pendingRows.length > 0) {
-    scheduleUpload(0);
+    scheduleUpload(0, "브라우저 저장소에 남아 있던 데이터를 즉시 서버로 전송");
   }
 });
