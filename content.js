@@ -1,31 +1,17 @@
-(function() {
-  const COLLECTOR_BUILD = "2026-06-26-popup-stack-v1";
+﻿(function() {
+  const COLLECTOR_BUILD = "2026-07-28-cpr-causal-grid-popup-v10";
   const EXTENSION_VERSION = chrome.runtime?.getManifest?.().version || "0.1.2";
   const EXTENSION_BUILD = `shell-${EXTENSION_VERSION}`;
   const REMOTE_SDK_SOURCE = "RAINBOW_COLLECTOR_SDK";
-  const REMOTE_SDK_DEFAULT_CHANNEL = "poc-uat";
+  const REMOTE_SDK_DEFAULT_CHANNEL = "stable";
   const REMOTE_SDK_MAX_PAYLOAD_BYTES = 32 * 1024;
   const REMOTE_SDK_ALLOWED_ORIGINS = new Set([
-    "http://127.0.0.1:19090",
-    "http://localhost:19090",
-    "http://192.168.131.128:19090",
-    "http://192.168.131.128:8080",
-    "https://collector.example.com"
+    "http://211.109.22.33:8791"
   ]);
   const GENERIC_GRID_MIN_CONFIDENCE = 0.72;
   const GENERIC_TREE_MIN_CONFIDENCE = 0.62;
   const standaloneOrigins = new Set([
-    "http://localhost:4175",
-    "http://127.0.0.1:4175",
-    "http://localhost:4181",
-    "http://127.0.0.1:4181",
-    "https://example.websquare.kr",
-    "https://demo.tobesoft.com",
-    "https://c4web.c4mix.com"
-  ]);
-  const integratedLabOrigins = new Set([
-    "http://localhost:5173",
-    "http://127.0.0.1:5173"
+    "http://211.109.22.33:8791"
   ]);
   const isRainbowlabCollectorPath =
     location.origin === "https://rainbowlab.ai.kr" &&
@@ -35,13 +21,9 @@
       location.pathname === "/mypage" ||
       location.pathname.startsWith("/mypage/")
     );
-  const isIntegratedCollectorTestPath =
-    location.pathname === "/collector-test" ||
-    location.pathname.startsWith("/collector-test/");
   const isAllowedTarget =
     standaloneOrigins.has(location.origin) ||
-    isRainbowlabCollectorPath ||
-    (integratedLabOrigins.has(location.origin) && isIntegratedCollectorTestPath);
+    isRainbowlabCollectorPath;
 
   if (!isAllowedTarget) return;
   if (document.documentElement?.getAttribute("data-az-collector-test") === "active") return;
@@ -49,11 +31,15 @@
   const pageSessionId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   let eventSequence = 0;
   let activeMenuContext = null;
+  let activeCprMenuContext = null;
+  let activeCprMenuContextUpdatedAt = 0;
+  let cprMenuContextRefreshTimer = null;
   let lastUserAction = null;
   const recentUserActions = [];
   const apiRequestInteractions = new Map();
   const apiTransactionBuffer = new Map();
   const recentRouteChanges = [];
+  let lastApiTransactionLink = null;
   const globalUiOutcomeState = new Map();
   const bridgeNonce = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const remoteSdkToken = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -62,9 +48,11 @@
   const INPUT_EVENT_DEBOUNCE_MS = 350;
   const SCREEN_CHANGE_DEBOUNCE_MS = 800;
   const ROUTE_POLL_INTERVAL_MS = 1000;
+  const CAUSAL_RELATION_TTL_MS = 5000;
   const STRUCTURE_CACHE_TTL_MS = 5000;
   const MAX_CONTEXT_CANDIDATES = 3;
   const MAX_DEBUG_CANDIDATES = 3;
+  const MAX_GRID_ROW_FIELDS = 30;
   const GRID_ADAPTER_TIMEOUT_MS = 50;
   const INTERNAL_GRID_ADAPTER_TIMEOUT_MS = 150;
   const LATE_GRID_ADAPTER_TIMEOUT_MS = 1500;
@@ -74,6 +62,10 @@
   const CONTENT_SEND_MAX_RETRIES = 3;
   const CONTENT_SEND_BUFFER_LIMIT = 300;
   const CONTENT_SEND_MAX_BATCH_ROWS = 50;
+  const CPR_MENU_CONTEXT_TTL_MS = 15000;
+  const CPR_MENU_CONTEXT_REFRESH_DEBOUNCE_MS = 250;
+  const CONTENT_SEND_URGENT_RETRY_ROWS = Math.floor(CONTENT_SEND_BUFFER_LIMIT * 0.8);
+  const CONTENT_SEND_HARD_BUFFER_LIMIT = CONTENT_SEND_BUFFER_LIMIT + CONTENT_SEND_MAX_BATCH_ROWS;
   const DEBUG_LOG_ALL_COLLECTED_ROWS = true;
   const CAPTURE_FOCUS_ROWS = false;
   const CAPTURE_BLUR_ROWS = false;
@@ -141,16 +133,23 @@
     "component_id",
     "column_id",
     "column_label",
+    "column_key",
     "bind_column",
     "editor_id",
     "grid_editor",
     "row_index",
     "col_index",
+    "row_data",
+    "selected_row",
+    "headers",
+    "grid_cell_click",
+    "grid_row_select",
     "raw_value_source",
     "enrichment_context",
     "original_event_id",
     "original_interaction_id",
-    "related_interaction_id"
+    "related_interaction_id",
+    "related_event_id"
   ]);
   const FULL_SNAPSHOT_TRIGGERS = new Set([
     "collector_boot",
@@ -161,7 +160,8 @@
     "submit",
     "api_transaction",
     "api_transaction_error",
-    "api_transaction_timeout"
+    "api_transaction_timeout",
+    "popup_open"
   ]);
   const LOW_COST_SNAPSHOT_TRIGGERS = new Set([
     "click",
@@ -175,6 +175,11 @@
     "keydown",
     "paste",
     "canvas_click",
+    "grid_cell_click",
+    "grid_row_select",
+    "popup_open",
+    "popup_close",
+    "grid_context_enrichment",
     "ui_outcome",
     "screen_change",
     "page_close"
@@ -202,16 +207,27 @@
   let contentSendLastDroppedAt = null;
   let lastPageCloseEmittedAt = 0;
   let activeOutcomeObserver = null;
-  const POPUP_ROOT_SELECTOR = "dialog[open], [aria-modal='true'], [role='dialog'], [role='alertdialog'], .modal";
+  const POPUP_ROOT_SELECTOR = [
+    "dialog[open]",
+    "[aria-modal='true']",
+    "[role='dialog']",
+    "[role='alertdialog']",
+      ".modal",
+      ".cl-popup",
+      ".cl-dialog",
+      ".cl-window"
+    ].join(",");
   const VALUE_REFLECTION_WINDOW_MS = 1500;
   const VALUE_REFLECTION_CHECK_DELAYS_MS = [80, 250, 700, 1400];
   const VALUE_REFLECTION_MAX_CANDIDATES = 80;
   const RECENT_VALUE_EVENT_WINDOW_MS = 1800;
   const popupStateByElement = new WeakMap();
   const popupStateById = new Map();
+  const nativeDialogStateById = new Map();
   let popupSequence = 0;
   let visiblePopupIds = new Set();
   let popupLifecycleTimer = null;
+  let lowCostMutationObserver = null;
   const recentValueEventByElement = new WeakMap();
   const recentValueReflectionKeys = new Map();
   const compositionState = {
@@ -367,11 +383,13 @@
       typeof moduleConfig.loader_url === "string" && moduleConfig.loader_url.trim()
         ? moduleConfig.loader_url.trim()
         : (query?.get("az_sdk_loader") || "");
-    const fallbackLoaderUrl = integratedLabOrigins.has(location.origin)
-      ? "http://127.0.0.1:19090/sdk/collector-loader.js"
-      : "";
-    const resolvedLoaderUrl = loaderUrl || fallbackLoaderUrl;
+    const resolvedLoaderUrl = loaderUrl;
     if (!resolvedLoaderUrl) return null;
+    const tenantId =
+      typeof moduleConfig.tenant_id === "string" && moduleConfig.tenant_id.trim()
+        ? moduleConfig.tenant_id.trim()
+        : "";
+    if (!tenantId) return null;
 
     return {
       loaderUrl: resolvedLoaderUrl,
@@ -379,10 +397,7 @@
         typeof moduleConfig.channel === "string" && moduleConfig.channel.trim()
           ? moduleConfig.channel.trim()
           : REMOTE_SDK_DEFAULT_CHANNEL,
-      tenantId:
-        typeof moduleConfig.tenant_id === "string" && moduleConfig.tenant_id.trim()
-          ? moduleConfig.tenant_id.trim()
-          : "customer-test"
+      tenantId
     };
   }
 
@@ -424,7 +439,11 @@
     script.dataset.extensionBuild = EXTENSION_BUILD;
     script.onload = () => script.remove();
     script.onerror = () => {
-      console.warn("[collector-test] remote SDK loader injection failed");
+      console.warn("[Rainbow Collector] 원격 SDK loader 주입 실패", {
+        "실패 이유": "script load error",
+        "loader URL": loaderUrl.toString(),
+        "영향": "서버 SDK 기반 추가 수집 모듈은 동작하지 않고 extension 내장 수집만 동작함"
+      });
       script.remove();
     };
     (document.head || document.documentElement).appendChild(script);
@@ -920,8 +939,8 @@
           row_index: value.rowIndex ?? null,
           row_path: normalizePathParts(value.rowContext.row_path || value.rowContext.rowPath || []),
           row_label: value.rowContext.row_label || value.rowContext.rowLabel || null,
-          values: limitObjectEntries(value.rowContext.values || value.rowContext.map || null, 5),
-          map: limitObjectEntries(value.rowContext.map || value.rowContext.values || null, 5),
+          values: limitObjectEntries(value.rowContext.values || value.rowContext.map || null, MAX_GRID_ROW_FIELDS),
+          map: limitObjectEntries(value.rowContext.map || value.rowContext.values || null, MAX_GRID_ROW_FIELDS),
           confidence: value.rowContext.confidence ?? 0.95,
           candidates: limitCandidateList(value.rowContext.candidates || [], MAX_CONTEXT_CANDIDATES),
           capture_status: value.rowContext.capture_status || "complete",
@@ -941,9 +960,11 @@
       grid_id: value.gridId || null,
       dataset_id: value.datasetId || null,
       component_id: value.componentId || null,
-      row_index: value.rowIndex ?? null,
-      col_index: value.colIndex ?? null,
-      column_id: value.columnId || null,
+        app_id: value.appId || null,
+        row_index: value.rowIndex ?? null,
+        col_index: value.colIndex ?? null,
+        model_col_index: value.modelColIndex ?? null,
+        column_id: value.columnId || null,
       column_label: value.columnLabel || null,
       column_path: value.columnLabel ? [value.columnLabel] : null,
       column_key: value.columnId || value.columnLabel || null,
@@ -951,6 +972,7 @@
       raw_value: value.rawValue ?? null,
       row_context: rowContext,
       row_context_map: rowContext?.map || rowContext?.values || null,
+      headers: Array.isArray(value.headers) ? value.headers.slice(0, 40) : null,
       confidence: {
         grid: 0.98,
         row_mapping: rowContext?.confidence ?? 0.95,
@@ -1754,7 +1776,9 @@
       "submit",
       "compositionstart",
       "compositionend",
-      "canvas_click"
+      "canvas_click",
+      "grid_cell_click",
+      "grid_row_select"
     ].includes(action);
   }
 
@@ -1963,6 +1987,60 @@
 
   function resolveRelatedInteractionId(timeMs = Date.now(), requestId = null) {
     return resolveRelatedActionReference(timeMs, requestId)?.interactionId || null;
+  }
+
+  function relationContextFromReference(reference, strategyPrefix = "causal") {
+    if (!reference?.interactionId) return null;
+    return {
+      related_interaction_id: reference.interactionId,
+      related_event_id: reference.eventId || null,
+      related_action: reference.action || null,
+      related_strategy: reference.strategy
+        ? `${strategyPrefix}_${reference.strategy}`
+        : strategyPrefix
+    };
+  }
+
+  function resolveSubmitRelationReference(timeMs = Date.now()) {
+    const related = findRelatedActionAt(timeMs);
+    if (!related?.interactionId) return null;
+    if (!["click", "keydown", "canvas_click"].includes(related.action)) return null;
+    return {
+      interactionId: related.interactionId,
+      eventId: related.eventId || null,
+      action: related.action || null,
+      strategy: "recent_action_fallback"
+    };
+  }
+
+  function rememberApiTransactionLink(row) {
+    if (!row?.interaction_id || !row?.event_time) return;
+    lastApiTransactionLink = {
+      interactionId: row.interaction_id,
+      eventId: row.event_id || null,
+      action: row.action || "api_transaction",
+      eventTime: row.event_time,
+      timeMs: new Date(row.event_time).getTime(),
+      strategy: "recent_api_transaction"
+    };
+  }
+
+  function resolveRouteChangeRelationReference(timeMs = Date.now()) {
+    const baseTime = Number.isFinite(Number(timeMs)) ? Number(timeMs) : Date.now();
+    if (lastApiTransactionLink?.interactionId && Number.isFinite(lastApiTransactionLink.timeMs)) {
+      const elapsedMs = baseTime - lastApiTransactionLink.timeMs;
+      if (elapsedMs >= 0 && elapsedMs <= CAUSAL_RELATION_TTL_MS) {
+        return lastApiTransactionLink;
+      }
+    }
+    const related = findRelatedActionAt(baseTime);
+    if (!related?.interactionId) return null;
+    return {
+      interactionId: related.interactionId,
+      eventId: related.eventId || null,
+      action: related.action || null,
+      strategy: "recent_action_fallback"
+    };
   }
 
   function normalizePathParts(value) {
@@ -2214,6 +2292,12 @@
       path_text: pathText,
       selected_path: candidate.selected_path || path,
       selected_path_text: candidate.selected_path_text || pathText,
+      menu_id: candidate.menu_id || candidate.menuId || null,
+      program_id: candidate.program_id || candidate.programId || candidate.pgm_id || candidate.PGM_ID || null,
+      call_page: candidate.call_page || candidate.callPage || null,
+      top_menu_id: candidate.top_menu_id || candidate.topMenuId || null,
+      unit_system_rcd: candidate.unit_system_rcd || candidate.unitSystemRcd || null,
+      wrk_ara_rcd: candidate.wrk_ara_rcd || candidate.wrkAraRcd || null,
       depth: candidate.depth || path.length || null,
       menu_kind: candidate.menu_kind || "tree_selection",
       tree_parser: candidate.tree_parser || candidate.parser || null,
@@ -2430,6 +2514,72 @@
       selected_path: context.selected_path || path,
       selected_path_text: context.selected_path_text || pathText
     };
+  }
+
+  function normalizeCprMenuPathParts(value) {
+    if (Array.isArray(value)) {
+      return dedupeOrderedParts(value.flatMap((part) => normalizeCprMenuPathParts(part)));
+    }
+    if (typeof value === "string" && value.trim()) {
+      return dedupeOrderedParts(value
+        .split(/\s*(?:>|›|»)\s*/)
+        .map((part) => part.trim())
+        .filter(Boolean));
+    }
+    return [];
+  }
+
+  function normalizeCprMenuContext(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+    const path = normalizeCprMenuPathParts(value.path || value.selected_path || value.path_text || value.selected_path_text);
+    const pathText = value.path_text || value.selected_path_text || path.join(" > ") || null;
+    if (!pathText && !value.selected_label) return null;
+    return normalizeMenuContextCandidate({
+      ...value,
+      source: value.source || "cpr_runtime",
+      parser: value.parser || "cpr_dsAllMenu_mdi",
+      path,
+      path_text: pathText,
+      selected_path: value.selected_path || path,
+      selected_path_text: value.selected_path_text || pathText,
+      selected_label: value.selected_label || path[path.length - 1] || value.menu_name || null,
+      score: value.score ?? 12,
+      confidence: value.confidence ?? 0.95,
+      captureStatus: value.capture_status || value.captureStatus || "complete",
+      warnings: value.warnings || []
+    });
+  }
+
+  function setActiveCprMenuContext(value) {
+    const normalized = normalizeCprMenuContext(value);
+    if (!normalized) return null;
+    activeCprMenuContext = normalized;
+    activeCprMenuContextUpdatedAt = Date.now();
+    return activeCprMenuContext;
+  }
+
+  function currentActiveCprMenuContext() {
+    if (!activeCprMenuContext) return null;
+    if (Date.now() - activeCprMenuContextUpdatedAt > CPR_MENU_CONTEXT_TTL_MS) return null;
+    return activeCprMenuContext;
+  }
+
+  function requestCprMenuContext(reason = "manual", detail = {}) {
+    const requestId = `cpr-menu-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    requestMainWorldState("cpr_context", requestId, {
+      reason,
+      page_url: location.href,
+      page_title: document.title,
+      ...detail
+    });
+  }
+
+  function scheduleCprMenuContextRefresh(reason = "scheduled", detail = {}) {
+    if (cprMenuContextRefreshTimer) clearTimeout(cprMenuContextRefreshTimer);
+    cprMenuContextRefreshTimer = setTimeout(() => {
+      cprMenuContextRefreshTimer = null;
+      requestCprMenuContext(reason, detail);
+    }, CPR_MENU_CONTEXT_REFRESH_DEBOUNCE_MS);
   }
 
   function navLabelOf(el) {
@@ -2709,6 +2859,14 @@
         warnings: activeMenuContext.warnings || []
       });
     }
+    const cprMenuContext = currentActiveCprMenuContext();
+    if (cprMenuContext?.selected_path_text) {
+      candidates.push({
+        ...cprMenuContext,
+        score: 12,
+        warnings: cprMenuContext.warnings || []
+      });
+    }
     const treeCandidate = resolveTreeMenuCandidate(target);
     if (treeCandidate) candidates.push(treeCandidate);
     const sidebarCandidates = resolveSidebarMenuCandidates(target, { allowGlobal: allowGlobalFallback });
@@ -2797,6 +2955,85 @@
       column_path: columnPath.length > 0 ? columnPath : null,
       column_key: context.column_key || columnKeyFromPath(columnPath),
       cell_value: context.cell_value ?? context.clicked_value ?? null
+    };
+  }
+
+  function gridRowDataFromContext(context) {
+    if (!context || typeof context !== "object") return null;
+    const rowContext = context.row_context && typeof context.row_context === "object"
+      ? context.row_context
+      : {};
+    const value =
+      rowContext.row_data ||
+      rowContext.map ||
+      rowContext.values ||
+      context.row_context_map ||
+      null;
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? limitObjectEntries(value, MAX_GRID_ROW_FIELDS)
+      : value;
+  }
+
+  function gridHeadersFromContext(context) {
+    if (!context || typeof context !== "object") return null;
+    if (Array.isArray(context.headers) && context.headers.length > 0) {
+      return context.headers.slice(0, 40);
+    }
+    const headers = [];
+    const addHeader = (value) => {
+      const text = cleanMenuLabel(value || "");
+      if (text && !headers.includes(text)) headers.push(text);
+    };
+    if (Array.isArray(context.column_candidates)) {
+      for (const candidate of context.column_candidates) {
+        if (Array.isArray(candidate?.path)) {
+          addHeader(candidate.path[candidate.path.length - 1]);
+        }
+        addHeader(candidate?.label || candidate?.column_label || candidate?.key);
+      }
+    }
+    addHeader(context.column_label || context.column_key || context.column_id);
+    return headers.length > 0 ? headers.slice(0, 40) : null;
+  }
+
+  function buildGridCellInteractionPayload(gridContext, options = {}) {
+    const context = enrichGridContext(gridContext);
+    if (!context) return null;
+    const rowData = gridRowDataFromContext(context);
+    const rowIndex = context.row_index ?? context.row_context?.row_index ?? null;
+      const colIndex = context.col_index ?? null;
+      const modelColIndex = context.model_col_index ?? null;
+    const columnLabel = context.column_label || null;
+    const columnKey = context.column_key || context.column_id || columnLabel || null;
+    const cellValue = context.cell_value ?? null;
+    return {
+      kind: options.kind || "grid_cell_click",
+      source: options.source || context.source || context.parser || null,
+      framework: context.framework || null,
+      capture_status: context.capture_status || null,
+      grid_id: context.grid_id || context.component_id || null,
+      dataset_id: context.dataset_id || null,
+      component_id: context.component_id || null,
+        row_index: rowIndex,
+        col_index: colIndex,
+        model_col_index: modelColIndex,
+      column_key: columnKey,
+      column_id: context.column_id || null,
+      column_label: columnLabel,
+      cell_value: cellValue,
+      clicked_col_label: columnLabel || columnKey,
+      clicked_value: cellValue,
+      label: columnLabel || columnKey,
+      row_data: rowData || null,
+      selected_row: rowData ? {
+        row_index: rowIndex,
+        row_data: rowData
+      } : null,
+      headers: gridHeadersFromContext(context),
+      related_interaction_id: options.relatedInteractionId || null,
+      related_event_id: options.relatedEventId || null,
+      original_interaction_id: options.originalInteractionId || null,
+      original_event_id: options.originalEventId || null
     };
   }
 
@@ -4232,85 +4469,105 @@
       }));
   }
 
-  function resolveGenericGridCellContext(target) {
-    if (!(target instanceof Element) || target.closest("table") || findNexacroPivotRoot(target)) return null;
-    const clickedCell = target.closest(genericCellSelector());
-    if (!(clickedCell instanceof Element)) return null;
-
-    const roots = [];
-    let current = clickedCell;
-    while (current && current !== document.documentElement && roots.length < 8) {
-      if (hasGenericGridMarker(current) && !current.closest("table") && !findNexacroPivotRoot(current)) {
-        roots.push(current);
+  function resolveGenericGridCellContext(target, event = null) {
+    if (!(target instanceof Element)) return null;
+    const candidateTargets = [];
+    const addCandidate = (candidate) => {
+      if (candidate instanceof Element && !candidateTargets.includes(candidate)) {
+        candidateTargets.push(candidate);
       }
-      current = current.parentElement;
+    };
+    addCandidate(target);
+    if (typeof event?.composedPath === "function") {
+      for (const candidate of event.composedPath()) addCandidate(candidate);
     }
-    if (roots.length === 0) {
-      current = clickedCell.parentElement;
-      while (current && current !== document.documentElement && roots.length < 4) {
-        if (current.closest("table") || findNexacroPivotRoot(current)) {
-          current = current.parentElement;
-          continue;
-        }
-        const cellCount = current.querySelectorAll(genericCellSelector()).length;
-        if (cellCount >= 4 && cellCount <= 120) {
+    if (Number.isFinite(event?.clientX) && Number.isFinite(event?.clientY)) {
+      for (const candidate of document.elementsFromPoint(event.clientX, event.clientY)) {
+        addCandidate(candidate);
+      }
+    }
+
+    for (const candidateTarget of candidateTargets) {
+      if (candidateTarget.closest("table") || findNexacroPivotRoot(candidateTarget)) continue;
+      const clickedCell = candidateTarget.closest(genericCellSelector());
+      if (!(clickedCell instanceof Element)) continue;
+
+      const roots = [];
+      let current = clickedCell;
+      while (current && current !== document.documentElement && roots.length < 8) {
+        if (hasGenericGridMarker(current) && !current.closest("table") && !findNexacroPivotRoot(current)) {
           roots.push(current);
         }
         current = current.parentElement;
       }
-    }
+      if (roots.length === 0) {
+        current = clickedCell.parentElement;
+        while (current && current !== document.documentElement && roots.length < 4) {
+          if (current.closest("table") || findNexacroPivotRoot(current)) {
+            current = current.parentElement;
+            continue;
+          }
+          const cellCount = current.querySelectorAll(genericCellSelector()).length;
+          if (cellCount >= 4 && cellCount <= 120) {
+            roots.push(current);
+          }
+          current = current.parentElement;
+        }
+      }
 
-    let best = null;
-    for (const root of roots) {
-      const model = getGenericGridModel(root);
-      if (!model) continue;
-      const cell = model.cells.find((info) => info.element === clickedCell || info.element.contains(target));
-      if (!cell) continue;
-      if (!best || model.confidence > best.model.confidence) best = { model, cell };
-    }
+      let best = null;
+      for (const root of roots) {
+        const model = getGenericGridModel(root);
+        if (!model) continue;
+        const cell = model.cells.find((info) => info.element === clickedCell || info.element.contains(candidateTarget));
+        if (!cell) continue;
+        if (!best || model.confidence > best.model.confidence) best = { model, cell };
+      }
 
-    if (!best) return null;
+      if (!best) continue;
 
-    const colPath = genericGridColumnPathForCell(best.model, best.cell);
-    const rowPath = genericGridRowPathForCell(best.model, best.cell);
-    const rowContextMap = buildRowContextMap(rowPath, null, { clickedColIndex: best.cell.colIndex ?? best.cell.visualColIndex ?? 999, minScore: 0 });
-    const rowCells = best.model.cells
-      .filter((candidate) =>
-        candidate !== best.cell &&
-        candidate.visualRowIndex === best.cell.visualRowIndex &&
-        candidate.rect.right <= best.cell.rect.left + 1 &&
-        candidate.visualColIndex < best.cell.visualColIndex &&
-        (!candidate.isColumnHeader || candidate.isRowHeader)
-      )
-      .sort((a, b) => a.rect.left - b.rect.left);
-    const rowCandidatePairs = rowCells.map((candidate, index) => {
-      const keyPath = genericGridColumnPathForCell(best.model, candidate);
+      const colPath = genericGridColumnPathForCell(best.model, best.cell);
+      const rowPath = genericGridRowPathForCell(best.model, best.cell);
+      const rowContextMap = buildRowContextMap(rowPath, null, { clickedColIndex: best.cell.colIndex ?? best.cell.visualColIndex ?? 999, minScore: 0 });
+      const rowCells = best.model.cells
+        .filter((candidate) =>
+          candidate !== best.cell &&
+          candidate.visualRowIndex === best.cell.visualRowIndex &&
+          candidate.rect.right <= best.cell.rect.left + 1 &&
+          candidate.visualColIndex < best.cell.visualColIndex &&
+          (!candidate.isColumnHeader || candidate.isRowHeader)
+        )
+        .sort((a, b) => a.rect.left - b.rect.left);
+      const rowCandidatePairs = rowCells.map((candidate, index) => {
+        const keyPath = genericGridColumnPathForCell(best.model, candidate);
+        return {
+          key: keyPath[keyPath.length - 1] || `row_dim_${index + 1}`,
+          value: candidate.value,
+          colIndex: candidate.colIndex ?? candidate.visualColIndex ?? index,
+          source: candidate.isRowHeader ? "row_header" : "left_cell"
+        };
+      });
       return {
-        key: keyPath[keyPath.length - 1] || `row_dim_${index + 1}`,
-        value: candidate.value,
-        colIndex: candidate.colIndex ?? candidate.visualColIndex ?? index,
-        source: candidate.isRowHeader ? "row_header" : "left_cell"
+        root: best.model,
+        cell: best.cell.element,
+        model: best.model,
+        modelCell: best.cell,
+        parser: best.model.parser,
+        confidence: best.model.confidence,
+        confidenceReasons: best.model.confidence_reasons,
+        captureStatus: best.model.confidence >= 0.82 ? "complete" : "partial",
+        clickedValue: best.cell.value,
+        rowIndex: best.cell.rowIndex ?? best.cell.visualRowIndex,
+        colIndex: best.cell.colIndex ?? best.cell.visualColIndex,
+        rowPath,
+        rowLabel: rowPath.join(" > ") || null,
+        rowContextMap,
+        rowCandidatePairs,
+        colPath,
+        colLabel: colPath.join(" > ") || null
       };
-    });
-    return {
-      root: best.model,
-      cell: best.cell.element,
-      model: best.model,
-      modelCell: best.cell,
-      parser: best.model.parser,
-      confidence: best.model.confidence,
-      confidenceReasons: best.model.confidence_reasons,
-      captureStatus: best.model.confidence >= 0.82 ? "complete" : "partial",
-      clickedValue: best.cell.value,
-      rowIndex: best.cell.rowIndex ?? best.cell.visualRowIndex,
-      colIndex: best.cell.colIndex ?? best.cell.visualColIndex,
-      rowPath,
-      rowLabel: rowPath.join(" > ") || null,
-      rowContextMap,
-      rowCandidatePairs,
-      colPath,
-      colLabel: colPath.join(" > ") || null
-    };
+    }
+    return null;
   }
 
   function buildTableHeaderPaths(table) {
@@ -5090,53 +5347,72 @@
     }).filter((item) => item.rows.length > 0);
   }
 
-  function resolveAriaGridCellContext(target) {
+  function resolveAriaGridCellContext(target, event = null) {
     if (!(target instanceof Element)) return null;
-    const cell = target.closest('[role="gridcell"], [role="cell"], [role="columnheader"], [role="rowheader"]');
-    const root = cell?.closest?.('[role="grid"]');
-    if (!(cell instanceof Element) || !(root instanceof Element)) return null;
-
-    const row = cell.closest('[role="row"]');
-    const rows = [...root.querySelectorAll('[role="row"]')];
-    const rowIndex = row ? Math.max(0, rows.indexOf(row) - 1) : null;
-    const cellsInRow = row
-      ? [...row.querySelectorAll('[role="rowheader"], [role="gridcell"], [role="cell"]')]
-      : [];
-    const clickedColIndex = cellsInRow.indexOf(cell);
-    const headers = [...root.querySelectorAll('[role="columnheader"]')]
-      .map((header) => cleanMenuLabel(visibleTextOf(header) || textOf(header) || ""))
-      .filter(Boolean);
-    const colPath = headers[clickedColIndex] ? [headers[clickedColIndex]] : [];
-    const rowPairs = cellsInRow
-      .slice(0, Math.max(0, clickedColIndex))
-      .map((candidate, index) => ({
-        key: headers[index] || `row_dim_${index + 1}`,
-        value: visibleTextOf(candidate) || textOf(candidate),
-        colIndex: index,
-        source: candidate.getAttribute("role") === "rowheader" ? "row_header" : "left_cell"
-      }))
-      .filter((entry) => entry.value);
-    const rowPath = rowPairs
-      .filter((entry) => !looksNumericLikeText(entry.value))
-      .map((entry) => entry.value);
-
-    return {
-      root,
-      cell,
-      parser: "aria_grid",
-      confidence: 0.84,
-      confidenceReasons: ["aria_roles", "column_headers"],
-      captureStatus: headers.length > 0 ? "complete" : "partial",
-      clickedValue: visibleTextOf(cell) || textOf(cell) || null,
-      rowIndex,
-      colIndex: clickedColIndex >= 0 ? clickedColIndex : null,
-      rowPath,
-      rowLabel: rowPath.join(" > ") || null,
-      rowContextMap: buildRowContextMap(rowPath, rowPairs.map((entry) => entry.key), { clickedColIndex, minScore: 0 }),
-      rowCandidatePairs: rowPairs,
-      colPath,
-      colLabel: colPath.join(" > ") || null
+    const candidateTargets = [];
+    const addCandidate = (candidate) => {
+      if (candidate instanceof Element && !candidateTargets.includes(candidate)) {
+        candidateTargets.push(candidate);
+      }
     };
+    addCandidate(target);
+    if (typeof event?.composedPath === "function") {
+      for (const candidate of event.composedPath()) addCandidate(candidate);
+    }
+    if (Number.isFinite(event?.clientX) && Number.isFinite(event?.clientY)) {
+      for (const candidate of document.elementsFromPoint(event.clientX, event.clientY)) {
+        addCandidate(candidate);
+      }
+    }
+
+    for (const candidateTarget of candidateTargets) {
+      const cell = candidateTarget.closest('[role="gridcell"], [role="cell"], [role="columnheader"], [role="rowheader"]');
+      const root = cell?.closest?.('[role="grid"]');
+      if (!(cell instanceof Element) || !(root instanceof Element)) continue;
+
+      const row = cell.closest('[role="row"]');
+      const rows = [...root.querySelectorAll('[role="row"]')];
+      const rowIndex = row ? Math.max(0, rows.indexOf(row) - 1) : null;
+      const cellsInRow = row
+        ? [...row.querySelectorAll('[role="rowheader"], [role="gridcell"], [role="cell"]')]
+        : [];
+      const clickedColIndex = cellsInRow.indexOf(cell);
+      const headers = [...root.querySelectorAll('[role="columnheader"]')]
+        .map((header) => cleanMenuLabel(visibleTextOf(header) || textOf(header) || ""))
+        .filter(Boolean);
+      const colPath = headers[clickedColIndex] ? [headers[clickedColIndex]] : [];
+      const rowPairs = cellsInRow
+        .slice(0, Math.max(0, clickedColIndex))
+        .map((candidate, index) => ({
+          key: headers[index] || `row_dim_${index + 1}`,
+          value: visibleTextOf(candidate) || textOf(candidate),
+          colIndex: index,
+          source: candidate.getAttribute("role") === "rowheader" ? "row_header" : "left_cell"
+        }))
+        .filter((entry) => entry.value);
+      const rowPath = rowPairs
+        .filter((entry) => !looksNumericLikeText(entry.value))
+        .map((entry) => entry.value);
+
+      return {
+        root,
+        cell,
+        parser: "aria_grid",
+        confidence: 0.84,
+        confidenceReasons: ["aria_roles", "column_headers"],
+        captureStatus: headers.length > 0 ? "complete" : "partial",
+        clickedValue: visibleTextOf(cell) || textOf(cell) || null,
+        rowIndex,
+        colIndex: clickedColIndex >= 0 ? clickedColIndex : null,
+        rowPath,
+        rowLabel: rowPath.join(" > ") || null,
+        rowContextMap: buildRowContextMap(rowPath, rowPairs.map((entry) => entry.key), { clickedColIndex, minScore: 0 }),
+        rowCandidatePairs: rowPairs,
+        colPath,
+        colLabel: colPath.join(" > ") || null
+      };
+    }
+    return null;
   }
 
   function buildAdapterGridCandidate(adapter, context, options = {}) {
@@ -5278,6 +5554,14 @@
       writeGridAdapterCache(pending.cacheKey, normalizedContext);
     }
     const receivedAt = new Date().toISOString();
+    const gridCellPayload = buildGridCellInteractionPayload(normalizedContext, {
+      kind: "grid_cell_click",
+      source: "grid_context_enrichment",
+      relatedInteractionId: pending.originalInteractionId || null,
+      relatedEventId: pending.originalEventId || null,
+      originalInteractionId: pending.originalInteractionId || null,
+      originalEventId: pending.originalEventId || null
+    });
     const row = buildRow(pending.element || document.documentElement, "grid_context_enrichment", {
       eventTimeOverride: receivedAt,
       correlationId: pending.correlationId || null,
@@ -5301,7 +5585,22 @@
         original_interaction_id: pending.originalInteractionId || null
       })
     });
-    sendRows([row]);
+    const gridCellRow = gridCellPayload ? buildRow(pending.element || document.documentElement, "grid_cell_click", {
+      eventTimeOverride: receivedAt,
+      correlationId: pending.correlationId || null,
+      relatedInteractionId: pending.originalInteractionId || null,
+      gridContext: normalizedContext,
+      elementText:
+        gridCellPayload.cell_value != null
+          ? String(gridCellPayload.cell_value)
+          : gridCellPayload.column_label || gridCellPayload.column_key || gridCellPayload.grid_id || null,
+      payload: gridCellPayload,
+      snapshot: captureSnapshot("grid_cell_click", {
+        grid_cell_click: gridCellPayload,
+        grid_context: normalizedContext
+      })
+    }) : null;
+    sendRows(gridCellRow ? [row, gridCellRow] : [row]);
   }
 
   function resolveGridContextCandidates(target, event = null, baseContext = {}) {
@@ -5322,7 +5621,7 @@
       });
     }
 
-    const ariaGridContext = resolveAriaGridCellContext(target);
+    const ariaGridContext = resolveAriaGridCellContext(target, event);
     if (ariaGridContext) {
       candidates.push({
         kind: "aria",
@@ -5359,7 +5658,7 @@
       });
     }
 
-    const genericContext = resolveGenericGridCellContext(target);
+    const genericContext = resolveGenericGridCellContext(target, event);
     if (genericContext) {
       candidates.push({
         kind: "generic",
@@ -5432,6 +5731,66 @@
     }];
   }
 
+  function structuredCprDomGrids() {
+    return [...document.querySelectorAll(".cl-grid[role='grid'], [role='grid'][class*='cl-grid']")]
+      .filter(isVisibleCandidate)
+      .slice(0, 20)
+      .map((grid) => {
+        const headers = [...grid.querySelectorAll("[role='columnheader']")]
+          .slice(0, MAX_GRID_ROW_FIELDS)
+          .map((header, index) => ({
+            col_index: index,
+            label: sanitizeStructuredValue(visibleTextOf(header) || textOf(header), { key: "column_label", element: header }),
+            selector: cssPath(header)
+          }));
+        const rows = [...grid.querySelectorAll("[role='row']")]
+          .filter((row) => row.querySelector("[role='gridcell'],[role='cell']"))
+          .slice(0, 50)
+          .map((row, rowIndex) => ({
+            row_index: Number(row.getAttribute("aria-rowindex")) || rowIndex,
+            selected: row.getAttribute("aria-selected") === "true" || row.classList.contains("cl-selected"),
+            cells: [...row.querySelectorAll("[role='gridcell'],[role='cell']")]
+              .slice(0, MAX_GRID_ROW_FIELDS)
+              .map((cell, colIndex) => ({
+                col_index: Number(cell.getAttribute("aria-colindex")) || colIndex,
+                column_label: headers[colIndex]?.label || null,
+                value: sanitizeStructuredValue(visibleTextOf(cell) || textOf(cell), { key: "cell_value", element: cell }),
+                selector: cssPath(cell)
+              }))
+          }));
+        return {
+          kind: "cpr_dom_grid",
+          framework: "exbuilder6",
+          grid_id: grid.id || null,
+          selector: cssPath(grid),
+          headers,
+          rows
+        };
+      });
+  }
+
+  function structuredPopups() {
+    return visiblePopupRoots().map((root, index) => ({
+      ...popupDescriptor(root, index + 1),
+      controls: [...root.querySelectorAll("button,a,input,textarea,select,[role='button'],[role='textbox'],[role='combobox'],[role='grid']")]
+        .filter(isVisibleCandidate)
+        .slice(0, 80)
+        .map((control) => ({
+          tag: control.tagName?.toLowerCase() || null,
+          role: control.getAttribute("role") || null,
+          type: control.getAttribute("type") || null,
+          label: sanitizeStructuredValue(
+            control.getAttribute("aria-label") || visibleTextOf(control) || textOf(control),
+            { key: "associated_label", element: control }
+          ),
+          checked: "checked" in control ? Boolean(control.checked) : null,
+          selected: control.getAttribute("aria-selected") === "true",
+          selector_css: cssPath(control),
+          selector_xpath: xPath(control)
+        }))
+    }));
+  }
+
   function structuredMessages() {
     return [...document.querySelectorAll('[role="status"], .toast, .alert')].slice(0, 8).map((node) => ({
       selector: cssPath(node),
@@ -5454,7 +5813,9 @@
         generic_grids: structuredGenericGrids(),
         aria_grids: structuredAriaGrids(),
         custom_grids: structuredCustomGrids(),
+        cpr_dom_grids: structuredCprDomGrids(),
         trees: structuredTrees(),
+        popups: structuredPopups(),
         messages: structuredMessages(),
         extra: extra || null
       }
@@ -5529,17 +5890,22 @@
     if (!Number.isFinite(numeric) || numeric <= 0) return;
     contentSendDroppedCount += numeric;
     contentSendLastDroppedAt = new Date().toISOString();
-    console.warn("[collector-test] content row retry buffer dropped rows", {
-      droppedRowsCount: numeric,
-      totalDroppedCount: contentSendDroppedCount,
-      reason,
-      lastDroppedAt: contentSendLastDroppedAt
+    console.warn("[Rainbow Collector] 페이지 이벤트 임시 큐 하드 한도 초과로 일부 row 제거", {
+      "제거 row 수": numeric,
+      "누적 제거 row 수": contentSendDroppedCount,
+      "제거 이유": reason,
+      "마지막 제거 시각": contentSendLastDroppedAt,
+      "즉시 재전달 기준 row 수": CONTENT_SEND_URGENT_RETRY_ROWS,
+      "소프트 최대 row 수": CONTENT_SEND_BUFFER_LIMIT,
+      "하드 최대 row 수": CONTENT_SEND_HARD_BUFFER_LIMIT,
+      "영향": "background로 넘기지 못한 오래된 이벤트 일부가 누락될 수 있음",
+      "정상 기준": "이 로그는 자주 나오면 안 되며, 보통은 하드 한도 도달 전에 즉시 background로 다시 전달됩니다"
     });
   }
 
   function trimPendingContentRowsToLimit() {
-    if (pendingContentRows.length <= CONTENT_SEND_BUFFER_LIMIT) return;
-    const overflow = pendingContentRows.length - CONTENT_SEND_BUFFER_LIMIT;
+    if (pendingContentRows.length <= CONTENT_SEND_HARD_BUFFER_LIMIT) return;
+    const overflow = pendingContentRows.length - CONTENT_SEND_HARD_BUFFER_LIMIT;
     const droppedEntries = pendingContentRows.splice(0, overflow);
     for (const entry of droppedEntries) {
       const eventId = contentRowEventId(entry?.row);
@@ -5563,6 +5929,15 @@
       queued.push(row);
     }
     trimPendingContentRowsToLimit();
+    if (pendingContentRows.length >= CONTENT_SEND_URGENT_RETRY_ROWS) {
+      console.info("[Rainbow Collector] 페이지 이벤트 임시 큐가 많아져 즉시 background 재전달을 시작합니다", {
+        "현재 대기 row 수": pendingContentRows.length,
+        "즉시 재전달 기준 row 수": CONTENT_SEND_URGENT_RETRY_ROWS,
+        "소프트 최대 row 수": CONTENT_SEND_BUFFER_LIMIT,
+        "이유": "페이지 이벤트 임시 큐가 최대치에 가까워져 누락 위험을 줄이기 위해 바로 background로 다시 전달함"
+      });
+      scheduleContentRowsRetry(0);
+    }
     return queued;
   }
 
@@ -5584,15 +5959,103 @@
     return batch;
   }
 
+  function actionLabelForConsole(action) {
+    const key = String(action || "unknown");
+    const labels = {
+      collector_boot: "수집기 시작",
+      page_view: "페이지 진입",
+      route_change: "화면 이동",
+      click: "클릭",
+      canvas_click: "캔버스 클릭",
+      keydown: "키 입력",
+      change: "입력값 확정",
+      input: "입력 중",
+      submit: "폼 제출",
+      api_transaction: "Request/Response 완료",
+      api_transaction_error: "Request/Response 실패",
+      api_transaction_timeout: "Request/Response 시간 초과",
+      modal_open: "팝업 열림",
+      modal_close: "팝업 닫힘",
+      toast_message: "토스트 메시지",
+      popup_open: "팝업 열림",
+      popup_close: "팝업 닫힘",
+      grid_cell_click: "그리드 셀 클릭",
+      grid_row_select: "그리드 행 선택",
+      grid_context_enrichment: "그리드 보강"
+    };
+    return labels[key] || key;
+  }
+
+  function summarizeContentRowsForConsole(rows) {
+    const list = Array.isArray(rows) ? rows : [];
+    const actionCounts = {};
+    for (const row of list) {
+      const action = row?.action || "unknown";
+      const label = actionLabelForConsole(action);
+      actionCounts[label] = (actionCounts[label] || 0) + 1;
+    }
+
+    const actions = new Set(list.map((row) => row?.action).filter(Boolean));
+    let reason = "페이지에서 수집된 이벤트가 background 전송 큐로 넘어감";
+    if (actions.has("api_transaction_timeout")) {
+      reason = "Request 발생 후 제한 시간 안에 Response가 없어 timeout 이벤트가 생성됨";
+    } else if (actions.has("api_transaction_error")) {
+      reason = "Request/Response 처리 실패가 감지되어 실패 이벤트가 생성됨";
+    } else if (actions.has("api_transaction")) {
+      reason = "Request와 Response가 매칭되어 API transaction row가 생성됨";
+    } else if (actions.has("submit")) {
+      reason = "폼 제출이 발생해 API/화면 변화와 연결할 이벤트가 생성됨";
+    } else if (actions.has("grid_cell_click") || actions.has("grid_row_select")) {
+      reason = "그리드 행/셀 선택이 발생해 선택 행 구조와 후속 API 연결 이벤트가 생성됨";
+    } else if (actions.has("popup_open") || actions.has("popup_close")) {
+      reason = "팝업 열림/닫힘 lifecycle 이벤트가 생성됨";
+    } else if (actions.has("click") || actions.has("canvas_click")) {
+      reason = "사용자 클릭이 발생해 업무 흐름 시작점 이벤트가 생성됨";
+    } else if (actions.has("change") || actions.has("input") || actions.has("keydown")) {
+      reason = "입력값 변경 또는 키 입력이 발생해 입력 이벤트가 생성됨";
+    } else if (actions.has("route_change")) {
+      reason = "화면 경로 변경이 감지되어 route_change 이벤트가 생성됨";
+    } else if (actions.has("page_view") || actions.has("collector_boot")) {
+      reason = "페이지 진입 또는 수집기 시작 상태 기록 이벤트가 생성됨";
+    }
+
+    return {
+      rowCount: list.length,
+      reason,
+      actionCounts,
+      preview: list.slice(0, 5).map((row) => ({
+        action: row?.action || null,
+        label: actionLabelForConsole(row?.action),
+        event_id: row?.event_id || null,
+        page_url: row?.page_url || null,
+        selector: row?.selector_css || row?.selector_xpath || null,
+        api_url: row?.payload?.api_context?.url || null,
+        status: row?.payload?.api_context?.status ?? null
+      }))
+    };
+  }
+
   function debugLogCollectedRows(stage, rows) {
     if (!DEBUG_LOG_ALL_COLLECTED_ROWS) return;
     try {
       const rowCount = Array.isArray(rows) ? rows.length : 0;
-      console.groupCollapsed(`[collector-debug] ${stage} rows=${rowCount}`);
-      console.log(rows);
+      const summary = summarizeContentRowsForConsole(rows);
+      console.groupCollapsed(`[Rainbow Collector] 페이지→백그라운드 rows=${rowCount} · ${summary.reason}`);
+      console.log("요약", {
+        "전송 단계": stage,
+        "왜 넘어가나": summary.reason,
+        "이벤트 종류별 개수": summary.actionCounts,
+        "대표 이벤트": summary.preview,
+        "retry 버퍼 상태": {
+          "대기 row 수": pendingContentRows.length,
+          "최대 대기 row 수": CONTENT_SEND_BUFFER_LIMIT,
+          "전송 중 여부": contentSendInFlight
+        }
+      });
+      console.log("원본 rows", rows);
       console.groupEnd();
     } catch (error) {
-      console.log("[collector-debug] rows", rows);
+      console.log("[Rainbow Collector] 페이지 수집 rows", rows);
     }
   }
 
@@ -5670,18 +6133,27 @@
     if (normalizedRows.length === 0) return;
 
     if (contentSendInFlight || pendingContentRows.length > 0) {
-      enqueueContentRowsForRetry(normalizedRows, "buffered_while_retry_inflight");
+      const queued = enqueueContentRowsForRetry(normalizedRows, "buffered_while_retry_inflight");
+      if (DEBUG_LOG_ALL_COLLECTED_ROWS && queued.length > 0) {
+        console.info("[Rainbow Collector] background 전송 중이라 페이지 이벤트를 임시 큐에 보관", {
+          "보관 이유": "이전 전송 또는 재시도 처리 중",
+          "추가 보관 row 수": queued.length,
+          "현재 대기 row 수": pendingContentRows.length
+        });
+      }
       scheduleContentRowsRetry(0);
       return;
     }
 
     void deliverRowsToBackground(normalizedRows).catch((error) => {
       const reason = error?.message || "background_send_failed";
-      console.warn("[collector-test] sendRows failed, scheduling retry", {
-        reason,
-        rowCount: normalizedRows.length
+      const queued = enqueueContentRowsForRetry(normalizedRows, reason);
+      console.warn("[Rainbow Collector] background 전달 실패 · 페이지 이벤트를 임시 큐에 보관", {
+        "실패 이유": reason,
+        "보관 row 수": queued.length,
+        "현재 대기 row 수": pendingContentRows.length,
+        "다음 재시도 대기 ms": CONTENT_SEND_RETRY_DELAY_MS
       });
-      enqueueContentRowsForRetry(normalizedRows, reason);
       scheduleContentRowsRetry();
     });
   }
@@ -6004,6 +6476,9 @@
     if (extra?.relatedInteractionId) {
       payloadSource.related_interaction_id = extra.relatedInteractionId;
     }
+    if (extra?.relatedEventId) {
+      payloadSource.related_event_id = extra.relatedEventId;
+    }
     const scopedPayloadSource = sanitizeInputPayloadForElement(payloadSource, el);
     const payloadFields = sanitizeStructuredValue(scopedPayloadSource, {
       key: "payload"
@@ -6023,6 +6498,9 @@
       action === "compositionend" ||
       action === "route_change" ||
       action === "screen_change" ||
+      action === "api_transaction" ||
+      action === "api_transaction_error" ||
+      action === "api_transaction_timeout" ||
       /_click$/.test(action);
     const resolvedMenuContext = extra?.menuContext ?? resolveEffectiveMenuContext(el);
     const menuContext = shouldAttachMenuContext
@@ -6035,6 +6513,12 @@
           key: "grid_context"
         }))
       : undefined;
+    const gridInteractionPayload = gridContext
+      ? sanitizeStructuredValue(buildGridCellInteractionPayload(gridContext, {
+          kind: "grid_cell_click",
+          source: action
+        }), { key: "grid_cell_click" })
+      : null;
     const inputContext = buildInputContextFromPayload(payloadFields, el, action);
     const apiContext = buildApiContextFromPayload(payloadFields);
     const uiOutcomeContext = buildUiOutcomeContextFromPayload(payloadFields);
@@ -6078,6 +6562,17 @@
         ...payloadFields,
         ...(shouldAttachMenuContext ? { menu_context: menuContext ?? null } : {}),
         ...(gridContext ? { grid_context: gridContext } : {}),
+        ...(gridInteractionPayload ? {
+          grid_cell_click: gridInteractionPayload,
+          grid_id: gridInteractionPayload.grid_id || null,
+          row_index: gridInteractionPayload.row_index ?? null,
+          col_index: gridInteractionPayload.col_index ?? null,
+          column_key: gridInteractionPayload.column_key || null,
+          cell_value: gridInteractionPayload.cell_value ?? null,
+          row_data: gridInteractionPayload.row_data || null,
+          selected_row: gridInteractionPayload.selected_row || null,
+          headers: gridInteractionPayload.headers || null
+        } : {}),
         ...(inputContext ? { input_context: inputContext } : {}),
         ...(apiContext ? { api_context: apiContext } : {}),
         ...(uiOutcomeContext ? { ui_outcome: uiOutcomeContext } : {}),
@@ -6091,6 +6586,7 @@
           event_sequence: sequence,
           interaction_id: interactionId,
           related_interaction_id: extra?.relatedInteractionId || baseEventContext.related_interaction_id || null,
+          related_event_id: extra?.relatedEventId || baseEventContext.related_event_id || null,
           action,
           event_time: eventTime,
           correlation_id: correlationId,
@@ -6160,7 +6656,10 @@
     try {
       return JSON.parse(holder.textContent);
     } catch (error) {
-      console.warn("[collector-test] failed to parse embedded grid models", error);
+      console.warn("[Rainbow Collector] 내장 grid 모델 파싱 실패", {
+        "실패 이유": error?.message || String(error),
+        "영향": "해당 화면의 grid row/column 보강 정보가 일부 비어 있을 수 있음"
+      });
       return null;
     }
   }
@@ -6575,6 +7074,23 @@
 
   function emitPopupLifecycleRow(el, action, state, trigger) {
     if (!state) return null;
+    markStructureCacheDirty();
+    const isClose = action === "popup_close";
+    const lastActionTimeMs = Date.parse(lastUserAction?.eventTime || "");
+    const lastActionPopupId = lastUserAction?.popupContext?.active_popup_id || null;
+    const closeAction = isClose &&
+      lastUserAction?.action === "click" &&
+      Number.isFinite(lastActionTimeMs) &&
+      Date.now() - lastActionTimeMs <= 2000 &&
+      lastActionPopupId === state.popupId
+        ? lastUserAction
+        : null;
+    const relatedInteractionId = isClose
+      ? closeAction?.interactionId || null
+      : state.openedByInteractionId || null;
+    const relatedEventId = isClose
+      ? closeAction?.eventId || null
+      : state.openedByEventId || null;
     const computedContext = el instanceof Element ? buildPopupContext(el) : null;
     const descriptor = el instanceof Element ? popupDescriptor(el) || state.lastDescriptor : state.lastDescriptor;
     if (!descriptor) return null;
@@ -6588,7 +7104,7 @@
     const popupContext = {
       stack_depth: stack.length,
       is_inside_popup: true,
-      lifecycle_action: action === "popup_close" ? "close" : "open",
+      lifecycle_action: isClose ? "close" : "open",
       trigger,
       target_popup: descriptorWithDepth,
       active_popup_id: descriptorWithDepth.popup_id,
@@ -6597,16 +7113,28 @@
       active_parent_popup_id: descriptorWithDepth.parent_popup_id,
       opener_interaction_id: state.openedByInteractionId,
       opener_event_id: state.openedByEventId,
+      closer_interaction_id: closeAction?.interactionId || null,
+      closer_event_id: closeAction?.eventId || null,
       stack
     };
     const row = buildRow(el instanceof Element ? el : document.documentElement, action, {
       eventTimeOverride: observedAt,
       elementText: descriptor.title || action,
-      relatedInteractionId: state.openedByInteractionId || null,
+      relatedInteractionId,
+      relatedEventId,
       payload: {
         kind: "popup_lifecycle",
         popup_context: popupContext,
         popup_action: popupContext.lifecycle_action,
+        related_event_id: relatedEventId,
+        relation_context: {
+          related_interaction_id: relatedInteractionId,
+          related_event_id: relatedEventId,
+          related_action: closeAction?.action || state.sourceAction || null,
+          related_strategy: isClose
+            ? (closeAction ? "popup_closer_click" : "popup_close_unresolved")
+            : "popup_opener_action"
+        },
         observed_at: observedAt
       },
       snapshot: captureSnapshot(action, {
@@ -6644,6 +7172,8 @@
       if (!state || state.closeEmitted) continue;
       state.closeEmitted = true;
       emitPopupLifecycleRow(state.element, "popup_close", state, trigger);
+      popupStateByElement.delete(state.element);
+      popupStateById.delete(popupId);
     }
 
     visiblePopupIds = currentIds;
@@ -6699,7 +7229,7 @@
     if (outcomeKind === "modal" || isPopupRoot(element)) {
       refreshPopupLifecycle("ui_outcome", {
         openedByInteractionId: state.interactionId,
-        openedByEventId: null,
+        openedByEventId: state.sourceEventId,
         sourceAction: state.sourceAction
       });
     }
@@ -6710,6 +7240,7 @@
       outcome_message: message,
       source_action: state.sourceAction,
       source_interaction_id: state.interactionId,
+      source_event_id: state.sourceEventId,
       observed_at: new Date().toISOString()
     };
 
@@ -6717,6 +7248,7 @@
       eventTimeOverride: payload.observed_at,
       elementText: message,
       relatedInteractionId: state.interactionId,
+      relatedEventId: state.sourceEventId,
       payload,
       popupContext: buildPopupContext(element),
       snapshot: captureSnapshot("ui_outcome", {
@@ -6751,13 +7283,16 @@
     }
   }
 
-  function observeUiOutcomes(interactionId, sourceAction) {
+  function observeUiOutcomes(interactionId, sourceAction, sourceEventId = null) {
     if (!interactionId || !document.body) return;
     stopUiOutcomeObservation();
 
     const state = {
       interactionId,
       sourceAction,
+      sourceEventId: sourceEventId || (
+        lastUserAction?.interactionId === interactionId ? lastUserAction.eventId || null : null
+      ),
       signatures: new Set(),
       baselineSignatures: collectUiOutcomeSignatures(),
       count: 0,
@@ -6916,6 +7451,22 @@
     return sanitizeStructuredValue(clonePayloadValue(value), { key: "popup_context" });
   }
 
+  function isPopupContextCurrentlyVisible(value) {
+    const popupId = value?.active_popup_id || null;
+    if (!popupId) return false;
+    return visiblePopupRoots().some((root) => {
+      const state = popupStateByElement.get(root) || ensurePopupState(root);
+      return state?.popupId === popupId;
+    });
+  }
+
+  function preferLivePopupContext(candidateContext, liveContext) {
+    const candidate = clonePopupContextForApi(candidateContext);
+    if (!candidate) return liveContext || null;
+    if (!candidate.active_popup_id) return liveContext || candidate;
+    return isPopupContextCurrentlyVisible(candidate) ? candidate : (liveContext || null);
+  }
+
   function findRecentActionForReference(reference) {
     if (!reference?.interactionId && !reference?.eventId) return null;
     for (let index = recentUserActions.length - 1; index >= 0; index -= 1) {
@@ -6931,22 +7482,28 @@
   }
 
   function captureApiStartPopupContext(related) {
+    const activeElement = document.activeElement instanceof Element
+      ? document.activeElement
+      : document.documentElement;
+    const liveContext = clonePopupContextForApi(buildPopupContext(activeElement));
     const relatedAction = findRecentActionForReference(related);
-    if (relatedAction) return clonePopupContextForApi(relatedAction.popupContext);
+    if (relatedAction) return preferLivePopupContext(relatedAction.popupContext, liveContext);
     if (
       related?.interactionId &&
       lastUserAction?.interactionId === related.interactionId
     ) {
-      return clonePopupContextForApi(lastUserAction.popupContext);
+      return preferLivePopupContext(lastUserAction.popupContext, liveContext);
     }
-    const activeElement = document.activeElement instanceof Element
-      ? document.activeElement
-      : document.documentElement;
-    return clonePopupContextForApi(buildPopupContext(activeElement));
+    return liveContext;
   }
 
-  function buildApiRequestStartContext(pending, popupContext) {
+  function buildApiRequestStartContext(pending, popupContext, menuContextOverride = null) {
     const active = popupContext && typeof popupContext === "object" ? popupContext : null;
+    const menuContext = menuContextOverride && typeof menuContextOverride === "object"
+      ? menuContextOverride
+      : pending?.menuContext && typeof pending.menuContext === "object"
+      ? pending.menuContext
+      : null;
     return {
       page_url: pending?.pageUrl || location.href,
       page_session_id: pending?.pageSessionId || pageSessionId,
@@ -6955,7 +7512,9 @@
       active_popup_id: active?.active_popup_id || null,
       active_popup_depth: active?.active_popup_depth ?? null,
       active_parent_popup_id: active?.active_parent_popup_id || null,
-      popup_stack_depth: active?.stack_depth ?? null
+      popup_stack_depth: active?.stack_depth ?? null,
+      menu_context: menuContext,
+      menu_path_text: menuContext?.selected_path_text || menuContext?.path_text || null
     };
   }
 
@@ -6970,6 +7529,9 @@
     const startedAtMs = Number(payload.startedAtMs || payload.started_at_ms || Date.now());
     const related = resolveRelatedActionReference(startedAtMs, null);
     const popupContext = captureApiStartPopupContext(related);
+    const cprMenuContext = normalizeCprMenuContext(payload.cprMenuContext || payload.cpr_menu_context || null);
+    if (cprMenuContext) setActiveCprMenuContext(cprMenuContext);
+    const menuContext = cprMenuContext || currentActiveCprMenuContext();
     const maxBufferSize = Math.max(1, Number(config.max_buffer_size || DEFAULT_API_CAPTURE_CONFIG.max_buffer_size));
     while (apiTransactionBuffer.size >= maxBufferSize) {
       const oldestKey = apiTransactionBuffer.keys().next().value;
@@ -6992,6 +7554,7 @@
       relatedAction: related.action || null,
       relatedStrategy: related.strategy || "none",
       popupContext,
+      menuContext,
       pageUrl: location.href,
       pageSessionId
     });
@@ -7042,6 +7605,11 @@
     const popupContext = Object.prototype.hasOwnProperty.call(pending || {}, "popupContext")
       ? clonePopupContextForApi(pending.popupContext)
       : captureApiStartPopupContext(related);
+    const cprMenuContext = normalizeCprMenuContext(
+      pending?.menuContext || payload.cprMenuContext || payload.cpr_menu_context || null
+    );
+    if (cprMenuContext) setActiveCprMenuContext(cprMenuContext);
+    const menuContext = cprMenuContext || currentActiveCprMenuContext();
     const skipReason = isInternalCollectorEndpoint(url)
       ? "internal_collector_endpoint"
       : "disabled_by_privacy_policy";
@@ -7074,7 +7642,8 @@
         related_action: pending?.relatedAction || related.action || null
       },
       popupContext,
-      requestContext: buildApiRequestStartContext(pending, popupContext)
+      menuContext,
+      requestContext: buildApiRequestStartContext(pending, popupContext, menuContext)
     };
   }
 
@@ -7087,18 +7656,20 @@
     }
 
     const transaction = buildApiTransactionPayload(type, rawPayload, pending, options);
-    return buildRow(document.documentElement, transaction.action, {
+    const row = buildRow(document.documentElement, transaction.action, {
       eventTimeOverride: transaction.eventTime,
       elementText: transaction.action,
       correlationId: transaction.apiContext.correlation_id,
       relatedInteractionId: transaction.relationContext.related_interaction_id,
       popupContext: transaction.popupContext,
+      menuContext: transaction.menuContext,
       payload: {
         kind: "api_transaction",
         api_context: transaction.apiContext,
         relation_context: transaction.relationContext,
         request_context: transaction.requestContext,
         popup_context: transaction.popupContext,
+        menu_context: transaction.menuContext,
         related_interaction_id: transaction.relationContext.related_interaction_id,
         related_event_id: transaction.relationContext.related_event_id,
         related_strategy: transaction.relationContext.related_strategy
@@ -7109,6 +7680,8 @@
         popup_context: transaction.popupContext
       })
     });
+    rememberApiTransactionLink(row);
+    return row;
   }
 
   function buildLegacyApiRow(type, rawPayload) {
@@ -7148,6 +7721,88 @@
     })]);
   }
 
+  function emitNativeDialogBridgeRow(type, rawPayload) {
+    const payload = rawPayload && typeof rawPayload === "object" ? rawPayload : {};
+    const dialogId = String(payload.dialogId || payload.dialog_id || "").slice(0, 128);
+    if (!dialogId) return;
+    const isOpen = type === "NATIVE_DIALOG_OPEN";
+    const observedAtMs = Number(payload.observedAtMs || payload.observed_at_ms || Date.now());
+    let state = nativeDialogStateById.get(dialogId) || null;
+
+    if (isOpen) {
+      const related = resolveRelatedActionReference(observedAtMs, null);
+      state = {
+        relatedInteractionId: related.interactionId || null,
+        relatedEventId: related.eventId || null,
+        relatedAction: related.action || null,
+        openedAt: eventTimeToIso(observedAtMs)
+      };
+      nativeDialogStateById.set(dialogId, state);
+    }
+
+    const action = isOpen ? "popup_open" : "popup_close";
+    const dialogType = String(payload.dialogType || payload.dialog_type || "alert").slice(0, 32);
+    const dialogMessage = sanitizeStructuredValue(payload.message || null, { key: "dialog_message" });
+    const descriptor = {
+      popup_id: dialogId,
+      parent_popup_id: null,
+      depth: 1,
+      role: dialogType === "alert" ? "alertdialog" : "dialog",
+      tag: "native_dialog",
+      title: dialogMessage ? String(dialogMessage).slice(0, 160) : dialogType,
+      selector_css: null,
+      selector_xpath: null,
+      opened_at: state?.openedAt || null,
+      opened_by_interaction_id: state?.relatedInteractionId || null,
+      opened_by_event_id: state?.relatedEventId || null,
+      source_action: state?.relatedAction || null
+    };
+    const popupContext = {
+      stack_depth: 1,
+      is_inside_popup: true,
+      lifecycle_action: isOpen ? "open" : "close",
+      trigger: "native_dialog_bridge",
+      target_popup: descriptor,
+      active_popup_id: dialogId,
+      active_popup_depth: 1,
+      active_popup_title: descriptor.title,
+      active_parent_popup_id: null,
+      opener_interaction_id: state?.relatedInteractionId || null,
+      opener_event_id: state?.relatedEventId || null,
+      stack: [descriptor]
+    };
+    const relationContext = {
+      related_interaction_id: state?.relatedInteractionId || null,
+      related_event_id: state?.relatedEventId || null,
+      related_action: state?.relatedAction || null,
+      related_strategy: "native_dialog_bridge"
+    };
+    const row = buildRow(document.documentElement, action, {
+      eventTimeOverride: payload.observedAt || payload.observed_at || observedAtMs,
+      elementText: descriptor.title,
+      relatedInteractionId: state?.relatedInteractionId || null,
+      popupContext,
+      payload: {
+        kind: "native_dialog_lifecycle",
+        dialog_type: dialogType,
+        dialog_message: dialogMessage,
+        popup_action: popupContext.lifecycle_action,
+        result_provided: payload.resultProvided === true,
+        accepted: typeof payload.accepted === "boolean" ? payload.accepted : null,
+        relation_context: relationContext,
+        popup_context: popupContext
+      },
+      snapshot: captureSnapshot(action, {
+        force_full_snapshot: isOpen,
+        native_dialog: descriptor,
+        relation_context: relationContext,
+        popup_context: popupContext
+      })
+    });
+    sendRows([row]);
+    if (!isOpen) nativeDialogStateById.delete(dialogId);
+  }
+
   const ALLOWED_BRIDGE_TYPES = new Set([
     "FETCH_START",
     "FETCH_HOOK",
@@ -7156,7 +7811,9 @@
     "XHR_HOOK",
     "XHR_ERROR",
     "STATE_SNAPSHOT",
-    "ROUTE_CHANGE"
+    "ROUTE_CHANGE",
+    "NATIVE_DIALOG_OPEN",
+    "NATIVE_DIALOG_CLOSE"
   ]);
 
   window.addEventListener("message", (event) => {
@@ -7170,6 +7827,11 @@
     if (event.data?.nonce !== bridgeNonce) return;
     if (!ALLOWED_BRIDGE_TYPES.has(event.data?.type)) return;
 
+    if (event.data.type === "NATIVE_DIALOG_OPEN" || event.data.type === "NATIVE_DIALOG_CLOSE") {
+      emitNativeDialogBridgeRow(event.data.type, event.data.payload || {});
+      return;
+    }
+
     if (event.data.type === "FETCH_START" || event.data.type === "XHR_START") {
       rememberApiTransactionStart(event.data.type, event.data.payload || {});
       return;
@@ -7181,9 +7843,13 @@
       const toUrl = payload.toUrl || payload.to_url || location.href;
       if (!shouldEmitRouteChange(fromUrl, toUrl, payload.trigger || "main_world")) return;
       lastRouteUrl = toUrl;
+      const changedAtMs = Number(payload.changedAtMs || payload.changed_at_ms || Date.parse(payload.changedAt || payload.changed_at || "") || Date.now());
+      const routeRelation = resolveRouteChangeRelationReference(changedAtMs);
+      const routeRelationContext = relationContextFromReference(routeRelation, "route_change");
       const row = buildRow(document.documentElement, "route_change", {
         eventTimeOverride: payload.changedAt || payload.changedAtMs || null,
         elementText: "route_change",
+        relatedInteractionId: routeRelation?.interactionId || null,
         payload: {
           kind: "route_change",
           route_context: {
@@ -7191,16 +7857,22 @@
             to_url: toUrl,
             trigger: payload.trigger || "main_world",
             changed_at: eventTimeToIso(payload.changedAt || payload.changedAtMs || Date.now())
-          }
+          },
+          ...(routeRelationContext ? { relation_context: routeRelationContext } : {})
         },
         snapshot: captureSnapshot("route_change", {
           from_url: fromUrl,
           to_url: toUrl,
-          trigger: payload.trigger || "main_world"
+          trigger: payload.trigger || "main_world",
+          relation_context: routeRelationContext
         })
       });
       sendRows([row]);
       resetActiveMenuContext("route_change");
+      scheduleCprMenuContextRefresh("route_change", {
+        from_url: fromUrl,
+        to_url: toUrl
+      });
       return;
     }
 
@@ -7228,6 +7900,11 @@
       const payload = event.data.payload || {};
       const requestId = payload.requestId || null;
       if (!requestId) return;
+
+      if (payload.kind === "cpr_context") {
+        if (!payload.error) setActiveCprMenuContext(payload.value);
+        return;
+      }
 
       const pendingAdapter = pendingGridAdapterRequests.get(requestId);
       if (pendingAdapter) {
@@ -7273,6 +7950,9 @@
   function onClick(event) {
     const target = semanticTargetFromEvent(event);
     if (!target) return;
+    schedulePopupLifecycleCheck("click");
+    setTimeout(() => refreshPopupLifecycle("click_followup"), 250);
+    scheduleCprMenuContextRefresh("click");
 
     const clickable = target.closest?.("button, a[href], td, th, [role='button'], [role='link'], [role='menuitem'], [role='tab'], [role='treeitem'], [role='gridcell'], [role='cell'], [role='columnheader'], [role='switch'], [aria-pressed], [aria-expanded], [data-action], [data-click], [onclick], [tabindex]:not([tabindex='-1']), .clickable, .card-action, [data-row-index][data-col-id], canvas") || target;
     const correlationId = clickable.getAttribute("data-correlation-id") || null;
@@ -7851,13 +8531,17 @@
     const target = event.target instanceof HTMLFormElement ? event.target : null;
     if (!target) return;
     const submitter = event.submitter instanceof Element ? event.submitter : null;
+    const submitRelation = resolveSubmitRelationReference(Date.now());
+    const submitRelationContext = relationContextFromReference(submitRelation, "submit");
     const row = buildRow(target, "submit", {
       elementText: submitter ? visibleTextOf(submitter) || textOf(submitter) : null,
+      relatedInteractionId: submitRelation?.interactionId || null,
       payload: {
         form_id: target.id || null,
         form_name: target.getAttribute("name") || null,
         submitter_text: submitter ? visibleTextOf(submitter) || textOf(submitter) : null,
-        submitter_selector: submitter ? cssPath(submitter) : null
+        submitter_selector: submitter ? cssPath(submitter) : null,
+        ...(submitRelationContext ? { relation_context: submitRelationContext } : {})
       },
       snapshot: captureSnapshot("submit", null)
     });
@@ -8009,7 +8693,11 @@
   }
 
   function installLowCostMutationDirtyTracking() {
-    if (!document.body || typeof MutationObserver !== "function") return;
+    if (lowCostMutationObserver || typeof MutationObserver !== "function") return;
+    if (!document.body) {
+      document.addEventListener("DOMContentLoaded", installLowCostMutationDirtyTracking, { once: true });
+      return;
+    }
     lastScreenSignature = buildScreenSignature();
     initializePopupLifecycleBaseline();
     const observer = new MutationObserver((mutations) => {
@@ -8027,7 +8715,11 @@
             popupRelated = true;
           }
         }
-        if (target?.matches?.(POPUP_ROOT_SELECTOR) || target?.closest?.(POPUP_ROOT_SELECTOR)) {
+        if (
+          target?.matches?.(POPUP_ROOT_SELECTOR) ||
+          target?.closest?.(POPUP_ROOT_SELECTOR) ||
+          target?.querySelector?.(POPUP_ROOT_SELECTOR)
+        ) {
           popupRelated = true;
         }
         if (target?.closest?.(".toast,.alert,[role='alert'],[role='status'],.modal,dialog,.dropdown,.tooltip")) {
@@ -8047,6 +8739,7 @@
       attributes: true,
       attributeFilter: ["class", "style", "hidden", "open", "role", "aria-hidden", "aria-modal", "aria-selected", "aria-current"]
     });
+    lowCostMutationObserver = observer;
   }
 
 
@@ -8076,10 +8769,13 @@
     lastRouteUrl = toUrl;
     markStructureCacheDirty();
     const changedAt = new Date().toISOString();
+    const routeRelation = resolveRouteChangeRelationReference(Date.parse(changedAt));
+    const routeRelationContext = relationContextFromReference(routeRelation, "route_change");
 
     const row = buildRow(document.documentElement, "route_change", {
       eventTimeOverride: changedAt,
       elementText: "route_change",
+      relatedInteractionId: routeRelation?.interactionId || null,
       payload: {
         kind: "route_change",
         route_context: {
@@ -8087,12 +8783,14 @@
           to_url: toUrl,
           trigger,
           changed_at: changedAt
-        }
+        },
+        ...(routeRelationContext ? { relation_context: routeRelationContext } : {})
       },
       snapshot: captureSnapshot("route_change", {
         from_url: fromUrl,
         to_url: toUrl,
-        trigger
+        trigger,
+        relation_context: routeRelationContext
       })
     });
     sendRows([row]);
@@ -8121,6 +8819,7 @@
 
   chrome.runtime.sendMessage({ type: "INJECT_MAIN_WORLD", nonce: bridgeNonce }, () => {
     void chrome.runtime.lastError;
+    scheduleCprMenuContextRefresh("main_world_injected");
   });
   requestRuntimeConfig();
 
