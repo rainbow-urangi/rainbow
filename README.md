@@ -7,6 +7,7 @@
   * `manifest.json` : MV3 설정(권한/서비스워커/콘텐츠 스크립트 구독)
   * `content.js` : 페이지 안에서 이벤트 수집(입력, 메뉴 클릭, SPA 라우팅, 페이지뷰)
   * `background.js` : 배치 수신/정규화/콘솔 로그/CSV 내보내기/네트워크 요청 연계
+  * `native-host/` : Windows 기본 라우트 기준 로컬 IPv4 조회 및 Native Messaging 설치
 
 * **핵심 산출물**
 
@@ -61,6 +62,14 @@
 1. `chrome://extensions` → 우측 상단 **Developer mode** ON
 2. **Load unpacked** → 이 프로젝트 루트 선택(세 파일이 동일 폴더에 있어야 함)
 3. 우측 툴바에서 퍼즐 아이콘(Extensions) → 본 확장 **Pin(고정)**
+4. 확장 ID를 확인하고 Native Host를 설치
+
+```powershell
+.\native-host\install-native-host.ps1 -ExtensionId '<확장 ID>' -Browser Chrome
+```
+
+Native Host가 설치되지 않으면 이벤트 수집은 계속되지만 로컬 IP의 `confidence`는
+`unavailable`이며 서버 관측 IP가 fallback으로 사용됩니다.
 
 ## 3.2 권한/설정(`manifest.json`)
 
@@ -71,7 +80,7 @@
   * `"content_scripts"` : `matches: ["<all_urls>"]`, `run_at: "document_start"`, `all_frames: true`
 * **권한**
 
-  * `"permissions": ["storage", "webNavigation", "webRequest", "alarms", "downloads", "tabs"]`
+  * `"permissions": ["storage", "tabs", "scripting", "alarms", "nativeMessaging"]`
   * `"host_permissions": ["<all_urls>"]`
 * **action / commands**
 
@@ -89,7 +98,7 @@
 | -------------------- | --------------------------------------------------------------- 
 | **AZ_api_url**       | 직전/동일 탭에서 감지된 네트워크 요청 URL(있으면)                  
 | **AZ_api_method**    | 요청 메서드(GET/POST 등)                                         
-| **AZ_ip_address**    | `(unavailable-in-extension)` 고정(서버에서 채우는 컬럼)           
+| **AZ_ip_address**    | Native Host가 기본 라우트에서 확인한 로컬 IPv4, 실패 시 서버 관측 IP
 | **AZ_url**           | 이벤트 발생 화면 URL                                             
 | **AZ_login_id**      | 확장 옵션 `loginId`(없으면 `unknown`)                            
 | **AZ_event_time**    | `YYYY-MM-DD HH:MM:SS[.mmm...]` (UTC)                            
@@ -101,6 +110,7 @@
 > **입력**은 **최종값만** 수집(중간 타이핑 노이즈 제거).
 > **비밀번호/민감값**은 `*****`로 마스킹.
 > 이메일은 사용자ID/도메인 일부만 보이도록 부분 마스킹.
+> 전체 IPv4 인터페이스와 선택 근거는 `AZ_locators_json.network_context`에 저장됩니다.
 
 ## 4.2 (선택) 분석용(analytics CSV)
 

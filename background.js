@@ -1,20 +1,17 @@
-try {
-  importScripts("config.local.js");
-} catch {}
-
 const DEFAULT_INGEST_URL = "https://rainbowlab.ai.kr/ingest/batch";
-const DEFAULT_PROD_COLLECTOR_KEY =
-  typeof globalThis.RAINBOW_COLLECTOR_CONFIG?.prodCollectorKey === "string"
-    ? globalThis.RAINBOW_COLLECTOR_CONFIG.prodCollectorKey.trim()
-    : "";
 const COLLECTOR_VERSION = chrome.runtime?.getManifest?.().version || "0.1.1";
 const QUEUE_KEY = "AZ_TEST_PENDING_ROWS";
 const COLLECTOR_INGEST_URL_KEY = "collectorIngestUrl";
 const TENANT_ID_KEY = "tenantId";
 const COLLECTOR_KEY_KEY = "collectorKey";
+const COLLECTOR_DEVICE_ID_KEY = "collectorDeviceInstallationId";
+const COLLECTOR_DEVICE_TOKEN_KEY = "collectorDeviceAccessToken";
+const COLLECTOR_DEVICE_TOKEN_EXPIRES_KEY = "collectorDeviceAccessTokenExpiresAtMs";
 const RUNTIME_CONFIG_URL_KEY = "collectorRuntimeConfigUrl";
 const RUNTIME_CONFIG_CACHE_KEY = "AZ_TEST_RUNTIME_CONFIG_CACHE";
 const DEFAULT_RUNTIME_CONFIG_TTL_MS = 5 * 60 * 1000;
+const NETWORK_CONTEXT_TTL_MS = 60 * 1000;
+const NETWORK_NATIVE_HOST = "kr.co.rainbowlab.network_context";
 const QUEUE_FLUSH_ALARM_NAME = "AZ_TEST_QUEUE_FLUSH_WAKE";
 const QUEUE_FLUSH_ALARM_PERIOD_MINUTES = 1;
 const DEBUG_LOG_ALL_UPLOAD_PAYLOADS = false;
@@ -61,6 +58,8 @@ let hydrated = false;
 let flushRequestedWhileInFlight = false;
 let retryAttempt = 0;
 let scheduledUploadReason = "content script가 전달한 수집 데이터를 서버로 전송";
+let networkContextCache = null;
+let networkContextCachedAt = 0;
 const pendingRows = [];
 
 function matchesCollectorTarget(url) {
@@ -157,6 +156,143 @@ function isProdCollectorUrl(url) {
   } catch {
     return false;
   }
+}
+
+function resolveCollectorKey(url, config) {
+  const storedKey = typeof config?.collectorKey === "string" ? config.collectorKey.trim() : "";
+  if (storedKey) return storedKey;
+  return "";
+}
+
+let collectorDeviceTokenRequest = null;
+
+function createCollectorDeviceId() {
+  if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  return `install-${Array.from(bytes, (value) => value.toString(16).padStart(2, "0")).join("")}`;
+}
+
+async function getCollectorDeviceId() {
+  const stored = await chrome.storage.local.get(COLLECTOR_DEVICE_ID_KEY);
+  const current = stored?.[COLLECTOR_DEVICE_ID_KEY];
+  if (typeof current === "string" && current.length >= 16) return current;
+  const created = createCollectorDeviceId();
+  await chrome.storage.local.set({ [COLLECTOR_DEVICE_ID_KEY]: created });
+  return created;
+}
+
+async function clearCollectorDeviceToken() {
+  await chrome.storage.local.remove([
+    COLLECTOR_DEVICE_TOKEN_KEY,
+    COLLECTOR_DEVICE_TOKEN_EXPIRES_KEY,
+  ]);
+}
+
+async function readCollectorAuthorization(url, config) {
+  const collectorKey = resolveCollectorKey(url, config);
+  if (collectorKey) {
+    return {
+      kind: "api_key",
+      headers: { "x-api-key": collectorKey, "X-Collector-Key": collectorKey },
+    };
+  }
+  if (!isProdCollectorUrl(url)) return { kind: "none", headers: {} };
+
+  const stored = await chrome.storage.local.get([
+    COLLECTOR_DEVICE_TOKEN_KEY,
+    COLLECTOR_DEVICE_TOKEN_EXPIRES_KEY,
+  ]);
+  const token = stored?.[COLLECTOR_DEVICE_TOKEN_KEY];
+  const expiresAtMs = Number(stored?.[COLLECTOR_DEVICE_TOKEN_EXPIRES_KEY] || 0);
+  if (typeof token === "string" && token && expiresAtMs > Date.now() + 5 * 60 * 1000) {
+    return { kind: "device_token", headers: { Authorization: `Bearer ${token}` } };
+  }
+
+  if (!collectorDeviceTokenRequest) {
+    collectorDeviceTokenRequest = (async () => {
+      const installationId = await getCollectorDeviceId();
+      const bootstrapUrl = new URL("/ingest/batch?bootstrap=device-token", url).toString();
+      const response = await fetch(bootstrapUrl, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Collector-Version": COLLECTOR_VERSION },
+        body: JSON.stringify({
+          installation_id: installationId,
+          extension_id: chrome.runtime.id,
+          collector_version: COLLECTOR_VERSION,
+        }),
+      });
+      if (!response.ok) throw new Error(`collector_bootstrap_failed_${response.status}`);
+      const payload = await response.json();
+      if (typeof payload?.access_token !== "string" || !Number(payload?.expires_at_ms)) {
+        throw new Error("collector_bootstrap_invalid_response");
+      }
+      await chrome.storage.local.set({
+        [COLLECTOR_DEVICE_TOKEN_KEY]: payload.access_token,
+        [COLLECTOR_DEVICE_TOKEN_EXPIRES_KEY]: Number(payload.expires_at_ms),
+      });
+      return payload.access_token;
+    })().finally(() => {
+      collectorDeviceTokenRequest = null;
+    });
+  }
+
+  const issuedToken = await collectorDeviceTokenRequest;
+  return { kind: "device_token", headers: { Authorization: `Bearer ${issuedToken}` } };
+}
+
+function isUsableIpv4(address) {
+  const parts = String(address || "").split(".");
+  if (parts.length !== 4 || parts.some((part) => !/^\d+$/.test(part) || Number(part) > 255)) {
+    return false;
+  }
+  return address !== "0.0.0.0" && !address.startsWith("127.") && !address.startsWith("169.254.");
+}
+
+async function readClientNetworkContext() {
+  if (networkContextCache && Date.now() - networkContextCachedAt < NETWORK_CONTEXT_TTL_MS) {
+    return networkContextCache;
+  }
+
+  let context;
+  try {
+    const response = await chrome.runtime.sendNativeMessage(NETWORK_NATIVE_HOST, {
+      type: "get_network_context",
+      collector_version: COLLECTOR_VERSION
+    });
+    if (!response || response.ok !== true) {
+      throw new Error(response?.error || "native_network_host_invalid_response");
+    }
+    const preferredIpv4 = isUsableIpv4(response.preferred_ipv4)
+      ? response.preferred_ipv4
+      : null;
+    const ipv4Interfaces = Array.isArray(response.ipv4_interfaces)
+      ? response.ipv4_interfaces.filter((item) => isUsableIpv4(item?.address))
+      : [];
+    context = {
+      source: "native_messaging_udp_route",
+      collected_at: new Date().toISOString(),
+      preferred_ipv4: preferredIpv4,
+      preferred_interface:
+        typeof response.preferred_interface === "string" ? response.preferred_interface : null,
+      confidence: preferredIpv4 && response.confidence === "high" ? "high" : "unavailable",
+      ipv4_interfaces: ipv4Interfaces,
+      native_host_version: response.native_host_version || null
+    };
+  } catch (error) {
+    context = {
+      source: "native_messaging_udp_route",
+      collected_at: new Date().toISOString(),
+      preferred_ipv4: null,
+      preferred_interface: null,
+      confidence: "unavailable",
+      ipv4_interfaces: [],
+      error: String(error?.message || error)
+    };
+  }
+
+  networkContextCache = context;
+  networkContextCachedAt = Date.now();
+  return context;
 }
 
 function normalizeStoredIngestUrl(url) {
@@ -403,9 +539,32 @@ function normalizeRowForCollector(row, ingestUrl) {
   };
 }
 
-function normalizeRowsForUpload(rows, ingestUrl) {
+function attachNetworkContext(row, networkContext) {
+  if (!row || typeof row !== "object") return row;
+  let locators = row.AZ_locators_json;
+  if (typeof locators === "string") {
+    try { locators = JSON.parse(locators); } catch { locators = {}; }
+  }
+  if (!locators || typeof locators !== "object" || Array.isArray(locators)) locators = {};
+  const existingIp = typeof row.AZ_ip_address === "string" ? row.AZ_ip_address.trim() : "";
+  return {
+    ...row,
+    AZ_ip_address:
+      existingIp && existingIp !== "(unavailable-in-extension)"
+        ? existingIp
+        : (networkContext?.preferred_ipv4 || null),
+    AZ_locators_json: {
+      ...locators,
+      network_context: toJsonSafeObject(networkContext)
+    }
+  };
+}
+
+function normalizeRowsForUpload(rows, ingestUrl, networkContext) {
   if (!Array.isArray(rows)) return [];
-  return rows.map((row) => normalizeRowForCollector(row, ingestUrl));
+  return rows.map((row) =>
+    attachNetworkContext(normalizeRowForCollector(row, ingestUrl), networkContext)
+  );
 }
 
 function buildQueueOverflowDiagnosticRow(droppedRowsCount) {
@@ -736,7 +895,9 @@ function resolveRuntimeConfigUrl(pageUrl, config) {
   if (config?.collectorRuntimeConfigUrl) return config.collectorRuntimeConfigUrl;
   const ingestUrl = resolveIngestUrl([{ page_url: pageUrl || null }], config);
   try {
-    return new URL("/collector/runtime-config", ingestUrl).toString();
+    return isProdCollectorUrl(ingestUrl)
+      ? new URL("/ingest/batch?runtime_config=1", ingestUrl).toString()
+      : new URL("/collector/runtime-config", ingestUrl).toString();
   } catch {
     return null;
   }
@@ -752,22 +913,20 @@ async function readRuntimeConfigForPage(pageUrl = null) {
   if (!runtimeConfigUrl) return normalizeRuntimeConfig(null);
 
   try {
-    const collectorKey = isProdCollectorUrl(runtimeConfigUrl)
-      ? DEFAULT_PROD_COLLECTOR_KEY
-      : (config.collectorKey || "");
+    const collectorAuthorization = await readCollectorAuthorization(runtimeConfigUrl, config);
     const response = await fetch(runtimeConfigUrl, {
       method: "GET",
       headers: {
         "X-Collector-Version": COLLECTOR_VERSION,
         ...(config.tenantId ? { "X-Tenant-Id": config.tenantId } : {}),
-        ...(collectorKey ? {
-          "x-api-key": collectorKey,
-          "X-Collector-Key": collectorKey
-        } : {})
+        ...collectorAuthorization.headers,
       }
     });
 
     if (!response.ok) {
+      if (response.status === 401 && collectorAuthorization.kind === "device_token") {
+        await clearCollectorDeviceToken();
+      }
       throw new Error(`runtime_config_failed_${response.status}`);
     }
 
@@ -832,19 +991,20 @@ async function flushUpload() {
   scheduledUploadReason = "전송 대기 중인 데이터를 서버로 전송";
   const pendingBefore = pendingRows.length;
   const rows = takeUploadBatch();
-  const config = await readCollectorConfig();
-  const ingestUrl = resolveIngestUrl(rows, config);
-  const uploadRows = normalizeRowsForUpload(rows, ingestUrl);
-  const collectorKey =
-    isProdCollectorUrl(ingestUrl)
-      ? DEFAULT_PROD_COLLECTOR_KEY
-      : (config.collectorKey || "");
+  let config = null;
+  let ingestUrl = DEFAULT_INGEST_URL;
+  let uploadRows = [];
+  let collectorAuthorization = { kind: "none", headers: {} };
   let shouldContinue = false;
   let retryDelay = null;
 
   try {
+    config = await readCollectorConfig();
+    ingestUrl = resolveIngestUrl(rows, config);
+    const networkContext = await readClientNetworkContext();
+    uploadRows = normalizeRowsForUpload(rows, ingestUrl, networkContext);
     if (uploadRows.length === 0) return;
-
+    collectorAuthorization = await readCollectorAuthorization(ingestUrl, config);
     const uploadPayload = { rows: uploadRows, ts: Date.now() };
     debugLogUploadPayload(ingestUrl, rows, uploadPayload, {
       reason: uploadReason,
@@ -857,15 +1017,15 @@ async function flushUpload() {
         "Content-Type": "application/json",
         "X-Collector-Version": COLLECTOR_VERSION,
         ...(config.tenantId ? { "X-Tenant-Id": config.tenantId } : {}),
-        ...(collectorKey ? {
-          "x-api-key": collectorKey,
-          "X-Collector-Key": collectorKey
-        } : {})
+        ...collectorAuthorization.headers,
       },
       body: JSON.stringify(uploadPayload)
     });
 
     if (!response.ok) {
+      if (response.status === 401 && collectorAuthorization.kind === "device_token") {
+        await clearCollectorDeviceToken();
+      }
       throw new Error(`ingest_failed_${response.status}`);
     }
 
