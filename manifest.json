@@ -1,20 +1,11 @@
 {
   "manifest_version": 3,
-  "name": "Rainbow Collector Extension 0.1.2",
-  "version": "0.1.2",
-  "description": "",
+  "name": "Rainbow Collector Extension",
+  "version": "0.1.12",
+  "description": "Browser workflow collector.",
   "permissions": ["storage", "tabs", "scripting", "alarms"],
   "host_permissions": [
-    "http://localhost:4175/*",
-    "http://127.0.0.1:4175/*",
-    "http://localhost:4181/*",
-    "http://127.0.0.1:4181/*",
-    "http://localhost:5173/*",
-    "http://127.0.0.1:5173/*",
-    "https://example.websquare.kr/*",
-    "https://demo.tobesoft.com/*",
-    "https://c4web.c4mix.com/*",
-    "http://192.168.131.128:8080/*",
+    "http://211.109.22.33:8791/*",
     "https://rainbowlab.ai.kr/*"
   ],
   "background": {
@@ -23,15 +14,7 @@
   "content_scripts": [
     {
       "matches": [
-        "http://localhost:4175/*",
-        "http://127.0.0.1:4175/*",
-        "http://localhost:4181/*",
-        "http://127.0.0.1:4181/*",
-        "http://localhost:5173/*",
-        "http://127.0.0.1:5173/*",
-        "https://example.websquare.kr/*",
-        "https://demo.tobesoft.com/*",
-        "https://c4web.c4mix.com/*",
+        "http://211.109.22.33:8791/*",
         "https://rainbowlab.ai.kr/*"
       ],
       "js": ["content.js"],
@@ -40,6 +23,6 @@
     }
   ],
   "action": {
-    "default_title": "Collector Test Extension"
+    "default_title": "Rainbow Collector"
   }
 }
