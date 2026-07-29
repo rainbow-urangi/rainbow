@@ -1,5 +1,5 @@
 ﻿(function() {
-  const COLLECTOR_BUILD = "2026-07-28-cpr-causal-grid-popup-v10";
+  const COLLECTOR_BUILD = "2026-07-29-cpr-menu-path-v11";
   const EXTENSION_VERSION = chrome.runtime?.getManifest?.().version || "0.1.2";
   const EXTENSION_BUILD = `shell-${EXTENSION_VERSION}`;
   const REMOTE_SDK_SOURCE = "RAINBOW_COLLECTOR_SDK";
@@ -31,6 +31,7 @@
   const pageSessionId = crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
   let eventSequence = 0;
   let activeMenuContext = null;
+  let activeCprDomMenuPath = [];
   let activeCprMenuContext = null;
   let activeCprMenuContextUpdatedAt = 0;
   let cprMenuContextRefreshTimer = null;
@@ -239,11 +240,226 @@
   const pendingSnapshots = new Map();
   let runtimeConfig = DEFAULT_RUNTIME_CONFIG;
   let runtimeConfigRefreshTimer = null;
+  let siteIdentityCandidate = null;
+  let siteIdentityCandidateElement = null;
+  let siteIdentityCandidateTimer = null;
+  let siteIdentitySubmitPending = false;
+  let siteIdentitySuccessApiObserved = false;
+  let siteIdentityProbeTimer = null;
+  let pocManualIdentityPromptOpen = false;
   try {
     document.documentElement.setAttribute("data-az-collector-test", "active");
     document.documentElement.setAttribute("data-az-collector-origin", location.origin);
     document.documentElement.setAttribute("data-az-collector-build", COLLECTOR_BUILD);
   } catch {}
+
+  function normalizeSiteIdentitySubject(value) {
+    const normalized = typeof value === "string" ? value.normalize("NFKC").trim() : "";
+    if (!normalized || normalized.length > 128) return null;
+    if (/[\u0000-\u001f\u007f]/.test(normalized)) return null;
+    return normalized;
+  }
+
+  function promptForPocManualIdentity() {
+    if (pocManualIdentityPromptOpen || location.origin !== "http://211.109.22.33:8791") return;
+    pocManualIdentityPromptOpen = true;
+    try {
+      const subject = normalizeSiteIdentitySubject(window.prompt("PoC 사용자 ID를 입력하세요", ""));
+      if (!subject) return;
+      chrome.runtime.sendMessage({ type: "POC_MANUAL_ID_SET", subject }, () => {
+        void chrome.runtime.lastError;
+      });
+    } finally {
+      pocManualIdentityPromptOpen = false;
+    }
+  }
+
+  chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message?.type !== "POC_MANUAL_ID_PROMPT") return false;
+    promptForPocManualIdentity();
+    sendResponse?.({ ok: true });
+    return false;
+  });
+
+  function isLoginIdentifierInput(element) {
+    if (!(element instanceof HTMLInputElement)) return false;
+    const type = String(element.type || "text").toLowerCase();
+    if (!["text", "email", "tel"].includes(type)) return false;
+    const isExcampusLoginInput = (() => {
+      if (location.origin !== "http://211.109.22.33:8791") return false;
+      const visibleIdentifiers = [...document.querySelectorAll("input[type='text'],input[type='email']")]
+        .filter((input) => isVisibleCandidate(input));
+      const visiblePasswords = [...document.querySelectorAll("input[type='password']")]
+        .filter((input) => isVisibleCandidate(input));
+      return visibleIdentifiers.length === 1 && visiblePasswords.length === 1 && visibleIdentifiers[0] === element;
+    })();
+    const autocomplete = String(element.autocomplete || element.getAttribute("autocomplete") || "").toLowerCase();
+    const hint = fieldHintText(element).toLowerCase();
+    const hasStrongHint = isExcampusLoginInput || autocomplete === "username" ||
+      /(^|\b)(user(name)?|login|account|member)[_-]?(id|name)?(\b|$)/i.test(hint) ||
+      /(아이디|사용자\s*(아이디|id)|로그인\s*(아이디|id)|사번|계정)/i.test(hint);
+    if (!hasStrongHint) return false;
+    const form = element.closest("form");
+    const scope = form || element.parentElement?.parentElement || document;
+    const hasPassword = Boolean(scope?.querySelector?.("input[type='password']"));
+    const hasTargetLoginPassword = location.origin === "http://211.109.22.33:8791" &&
+      Boolean(document.querySelector("input[type='password']"));
+    return isExcampusLoginInput || hasPassword || hasTargetLoginPassword;
+  }
+
+  function sendIdentityControlMessage(type, extra = {}) {
+    try {
+      chrome.runtime.sendMessage({
+        type,
+        pageSessionId,
+        pageUrl: location.href,
+        ...extra
+      }, () => void chrome.runtime.lastError);
+    } catch {}
+  }
+
+  function rememberSiteIdentityCandidate(element, trigger = "input", immediate = false) {
+    if (!isLoginIdentifierInput(element)) return;
+    const subject = normalizeSiteIdentitySubject(element.value);
+    if (!subject) return;
+    siteIdentityCandidate = subject;
+    siteIdentityCandidateElement = element;
+    if (siteIdentityCandidateTimer) clearTimeout(siteIdentityCandidateTimer);
+    const emit = () => {
+      siteIdentityCandidateTimer = null;
+      sendIdentityControlMessage("SITE_IDENTITY_CANDIDATE", { subject, trigger });
+    };
+    if (immediate) emit();
+    else siteIdentityCandidateTimer = setTimeout(emit, INPUT_EVENT_DEBOUNCE_MS);
+  }
+
+  function markSiteIdentitySubmitted(element, trigger) {
+    const form = element instanceof HTMLFormElement ? element : element?.closest?.("form");
+    const candidateInput = [...(form?.querySelectorAll?.("input") || [])].find(isLoginIdentifierInput) ||
+      siteIdentityCandidateElement;
+    if (candidateInput) rememberSiteIdentityCandidate(candidateInput, trigger, true);
+    if (!siteIdentityCandidate) return;
+    siteIdentitySubmitPending = true;
+    siteIdentitySuccessApiObserved = false;
+    sendIdentityControlMessage("SITE_IDENTITY_SUBMITTED", { trigger });
+    scheduleSiteIdentityProbe("login_submit", 300);
+  }
+
+  function isLoginSubmitControl(element) {
+    if (!(element instanceof Element)) return false;
+    const control = element.closest("button,input[type='submit'],[role='button'],[onclick]");
+    if (!control) return false;
+    const hint = `${control.getAttribute("id") || ""} ${control.getAttribute("name") || ""} ${control.getAttribute("value") || ""} ${visibleTextOf(control) || ""}`;
+    if (!/(login|logon|sign\s*in|로그인)/i.test(hint)) return false;
+    const form = control.closest("form");
+    return Boolean(form?.querySelector?.("input[type='password']")) ||
+      Boolean(document.querySelector("input[type='password']"));
+  }
+
+  function authenticatedSubjectFromDom() {
+    const selectors = [
+      "[data-authenticated-user-id]",
+      "html[data-login-id]",
+      "body[data-login-id]",
+      "header [data-login-id]",
+      "nav [data-login-id]",
+      "aside [data-login-id]",
+      "header [data-user-id]",
+      "nav [data-user-id]",
+      "aside [data-user-id]",
+      "header [data-username]",
+      "nav [data-username]",
+      "aside [data-username]",
+      "meta[name='user-id']"
+    ];
+    for (const element of document.querySelectorAll(selectors.join(","))) {
+      const value = element.getAttribute("data-authenticated-user-id") ||
+        element.getAttribute("data-login-id") ||
+        element.getAttribute("data-user-id") ||
+        element.getAttribute("data-username") ||
+        element.getAttribute("content");
+      const subject = normalizeSiteIdentitySubject(value);
+      if (subject) return subject;
+    }
+    return null;
+  }
+
+  function hasAuthenticatedShellEvidence() {
+    if (document.querySelector(
+      "a[href*='logout' i],button[id*='logout' i],[onclick*='logout' i],[data-action='logout'],[data-authenticated-user-id],header [data-login-id],nav [data-login-id],aside [data-login-id]"
+    )) return true;
+    return [...document.querySelectorAll("header button,header a,nav button,nav a,aside button,aside a,[role='button']")]
+      .slice(0, 100)
+      .some((element) => /(로그아웃|log\s*out|sign\s*out)/i.test(visibleTextOf(element) || ""));
+  }
+
+  function visiblePasswordInputExists() {
+    return [...document.querySelectorAll("input[type='password']")]
+      .some((element) => isVisibleCandidate(element));
+  }
+
+  function confirmSiteIdentity(subject, confidence, trigger) {
+    const normalized = normalizeSiteIdentitySubject(subject || siteIdentityCandidate);
+    if (!normalized) return;
+    siteIdentityCandidate = normalized;
+    siteIdentitySubmitPending = false;
+    siteIdentitySuccessApiObserved = false;
+    sendIdentityControlMessage("SITE_IDENTITY_CONFIRMED", {
+      subject: normalized,
+      confidence,
+      trigger
+    });
+  }
+
+  function probeSiteIdentity(trigger = "dom_probe") {
+    const domSubject = authenticatedSubjectFromDom();
+    if (domSubject) {
+      confirmSiteIdentity(domSubject, "verified_dom", trigger);
+      return;
+    }
+    const knownTargetPostLogin = location.origin === "http://211.109.22.33:8791" &&
+      !visiblePasswordInputExists();
+    if (
+      siteIdentitySubmitPending &&
+      siteIdentitySuccessApiObserved &&
+      !visiblePasswordInputExists() &&
+      (hasAuthenticatedShellEvidence() || knownTargetPostLogin)
+    ) {
+      confirmSiteIdentity(siteIdentityCandidate, "verified_post_login_dom", trigger);
+    }
+  }
+
+  function scheduleSiteIdentityProbe(trigger, delayMs = 250) {
+    if (siteIdentityProbeTimer) clearTimeout(siteIdentityProbeTimer);
+    siteIdentityProbeTimer = setTimeout(() => {
+      siteIdentityProbeTimer = null;
+      probeSiteIdentity(trigger);
+    }, Math.max(0, delayMs));
+  }
+
+  function observeSiteIdentityApiOutcome(type, payload) {
+    if (!siteIdentitySubmitPending || type.endsWith("_ERROR")) return;
+    const status = Number(payload?.status);
+    if (!Number.isFinite(status) || status < 200 || status >= 400) return;
+    const url = String(payload?.url || "");
+    if (!/(login|logon|signin|sign-in|auth|session)/i.test(url)) return;
+    siteIdentitySuccessApiObserved = true;
+    sendIdentityControlMessage("SITE_IDENTITY_LOGIN_RESPONSE", { url, status });
+    scheduleSiteIdentityProbe("login_api_response", 300);
+  }
+
+  function restoreSiteIdentityState() {
+    try {
+      chrome.runtime.sendMessage({ type: "SITE_IDENTITY_STATUS_GET" }, (response) => {
+        void chrome.runtime.lastError;
+        const subject = normalizeSiteIdentitySubject(response?.candidate?.subject || response?.identity?.subject);
+        if (subject) siteIdentityCandidate = subject;
+        siteIdentitySubmitPending = Boolean(response?.submitted_at && !response?.identity);
+        siteIdentitySuccessApiObserved = Boolean(response?.login_response_at && !response?.identity);
+        scheduleSiteIdentityProbe("state_restore", 0);
+      });
+    } catch {}
+  }
 
   function normalizeApiCaptureConfig(value) {
     const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
@@ -1645,6 +1861,7 @@
 
   function detectSensitiveKind(value, key, el) {
     const hint = `${String(key || "")} ${fieldHintText(el)}`.toLowerCase();
+    if (el && isLoginIdentifierInput(el)) return "identity";
     if (/(password|passwd|pwd|secret|token|bearer|authorization|auth|api[_-]?key|session|cookie|otp|pin)/i.test(hint)) {
       return "secret";
     }
@@ -1687,6 +1904,7 @@
     if (kind === "email") return maskEmail(value);
     if (kind === "phone") return maskPhone(value);
     if (kind === "password") return "[MASKED_PASSWORD]";
+    if (kind === "identity") return "[IDENTITY_CONTEXT]";
     if (kind === "secret") return "[REDACTED]";
     return "[MASKED]";
   }
@@ -2849,6 +3067,42 @@
     };
   }
 
+  function menuPathsCompatible(left, right) {
+    const a = normalizePathParts(left?.path || left?.selected_path);
+    const b = normalizePathParts(right?.path || right?.selected_path);
+    if (!a.length || !b.length) return false;
+    if (a[a.length - 1] === b[b.length - 1]) return true;
+    const short = a.length <= b.length ? a : b;
+    const long = a.length <= b.length ? b : a;
+    return short.every((part, index) =>
+      part === long[long.length - short.length + index]);
+  }
+
+  function cprMenuCandidateScore(context) {
+    return activeMenuContext?.selected_path_text &&
+      !menuPathsCompatible(activeMenuContext, context) ? 7 : 12;
+  }
+
+  function chooseActiveAndCprMenuContext(context) {
+    const candidates = [];
+    if (activeMenuContext?.selected_path_text) {
+      candidates.push({ ...activeMenuContext, score: 11 });
+    }
+    if (context?.selected_path_text || context?.path_text) {
+      const score = cprMenuCandidateScore(context);
+      candidates.push({
+        ...context,
+        score,
+        warnings: normalizeWarningList([
+          ...(context.warnings || []),
+          ...(score < 12 ? ["cpr_active_path_conflict"] : [])
+        ])
+      });
+    }
+    const best = chooseBestMenuCandidate(candidates);
+    return best ? withMenuCandidates(best, candidates) : null;
+  }
+
   function resolveMenuContextCandidates(target) {
     const candidates = [];
     const allowGlobalFallback = !(target instanceof Element && isInputLikeElement(target));
@@ -2861,10 +3115,14 @@
     }
     const cprMenuContext = currentActiveCprMenuContext();
     if (cprMenuContext?.selected_path_text) {
+      const score = cprMenuCandidateScore(cprMenuContext);
       candidates.push({
         ...cprMenuContext,
-        score: 12,
-        warnings: cprMenuContext.warnings || []
+        score,
+        warnings: normalizeWarningList([
+          ...(cprMenuContext.warnings || []),
+          ...(score < 12 ? ["cpr_active_path_conflict"] : [])
+        ])
       });
     }
     const treeCandidate = resolveTreeMenuCandidate(target);
@@ -2912,6 +3170,7 @@
   }
 
   function resetActiveMenuContext(reason = "manual_reset") {
+    activeCprDomMenuPath = [];
     if (!activeMenuContext) return false;
     activeMenuContext = null;
     return true;
@@ -5241,8 +5500,48 @@
     };
   }
 
+  function resolveCprLevelMenuPath(target) {
+    if (location.origin !== "http://211.109.22.33:8791" || !(target instanceof Element)) return null;
+    const item = target.closest("[class*='cl-level-']");
+    if (!(item instanceof Element)) return null;
+    const levelMatch = classTextOf(item).match(/(?:^|\s)cl-level-(\d+)(?:\s|$)/i);
+    if (!levelMatch) return null;
+    const level = Number(levelMatch[1]);
+    if (!Number.isInteger(level) || level < 1 || level > 12) return null;
+
+    const labelNode = target.closest(".cl-text") ||
+      item.querySelector(":scope > .cl-text, :scope > .cl-control > .cl-text, .cl-text");
+    const label = cleanMenuLabel(visibleTextOf(labelNode) || extractMenuItemLabel(item));
+    if (!shouldUseMenuLabel(label)) return null;
+
+    const prefix = activeCprDomMenuPath.slice(0, level - 1);
+    const parentComplete = level === 1 ||
+      (prefix.length === level - 1 && prefix.every(Boolean));
+    activeCprDomMenuPath = prefix;
+    activeCprDomMenuPath[level - 1] = label;
+    activeCprDomMenuPath.length = level;
+    const path = activeCprDomMenuPath.filter(Boolean);
+
+    return {
+      item,
+      source: "tree",
+      label,
+      path,
+      pathText: path.join(" > ") || null,
+      parser: "cpr_level_dom",
+      score: parentComplete ? 12 : 8,
+      confidence: parentComplete ? 0.99 : 0.68,
+      depth: level,
+      captureStatus: parentComplete ? "complete" : "partial",
+      confidenceReasons: ["cpr_level_class", "click_sequence"],
+      warnings: parentComplete ? [] : ["cpr_parent_path_missing"]
+    };
+  }
+
   function resolveTreePath(target) {
     if (!(target instanceof Element)) return null;
+    const cprItem = resolveCprLevelMenuPath(target);
+    if (cprItem) return cprItem;
     const ariaItem = target.closest('[role="treeitem"]');
     if (ariaItem) return resolveAriaTreePath(ariaItem);
     return resolveGenericTreePath(target);
@@ -6608,6 +6907,11 @@
           search: location.search || "",
           hash: location.hash || ""
         },
+        environment_context: {
+          ua: navigator.userAgent || null,
+          vw: Number.isFinite(window.innerWidth) ? window.innerWidth : null,
+          vh: Number.isFinite(window.innerHeight) ? window.innerHeight : null
+        },
         element_context: {
           selector_css: selectorCss,
           selector_xpath: selectorXpath,
@@ -7531,7 +7835,9 @@
     const popupContext = captureApiStartPopupContext(related);
     const cprMenuContext = normalizeCprMenuContext(payload.cprMenuContext || payload.cpr_menu_context || null);
     if (cprMenuContext) setActiveCprMenuContext(cprMenuContext);
-    const menuContext = cprMenuContext || currentActiveCprMenuContext();
+    const menuContext = chooseActiveAndCprMenuContext(
+      cprMenuContext || currentActiveCprMenuContext()
+    );
     const maxBufferSize = Math.max(1, Number(config.max_buffer_size || DEFAULT_API_CAPTURE_CONFIG.max_buffer_size));
     while (apiTransactionBuffer.size >= maxBufferSize) {
       const oldestKey = apiTransactionBuffer.keys().next().value;
@@ -7609,7 +7915,9 @@
       pending?.menuContext || payload.cprMenuContext || payload.cpr_menu_context || null
     );
     if (cprMenuContext) setActiveCprMenuContext(cprMenuContext);
-    const menuContext = cprMenuContext || currentActiveCprMenuContext();
+    const menuContext = chooseActiveAndCprMenuContext(
+      cprMenuContext || currentActiveCprMenuContext()
+    );
     const skipReason = isInternalCollectorEndpoint(url)
       ? "internal_collector_endpoint"
       : "disabled_by_privacy_policy";
@@ -7882,6 +8190,7 @@
       event.data.type === "XHR_HOOK" ||
       event.data.type === "XHR_ERROR"
     ) {
+      observeSiteIdentityApiOutcome(event.data.type, event.data.payload || {});
       const config = apiCaptureConfig();
       if (!config.enabled) return;
 
@@ -7950,6 +8259,7 @@
   function onClick(event) {
     const target = semanticTargetFromEvent(event);
     if (!target) return;
+    if (isLoginSubmitControl(target)) markSiteIdentitySubmitted(target, "login_click");
     schedulePopupLifecycleCheck("click");
     setTimeout(() => refreshPopupLifecycle("click_followup"), 250);
     scheduleCprMenuContextRefresh("click");
@@ -8012,6 +8322,11 @@
     const treeContext = resolveTreePath(target);
     if (treeContext) {
       const menuContext = updateActiveMenuContext(treeContext);
+      scheduleCprMenuContextRefresh("menu_click", {
+        clicked_label: treeContext.label,
+        clicked_path: treeContext.path,
+        clicked_level: treeContext.depth || treeContext.path?.length || null
+      });
       const row = buildRow(treeContext.item, "click", {
         correlationId,
         menuContext,
@@ -8297,6 +8612,7 @@
   function onChange(event) {
     const target = event.target instanceof Element ? event.target : null;
     if (!target) return;
+    rememberSiteIdentityCandidate(target, "change", true);
     rememberRecentValueEvent(target, "change");
 
     const value = sanitizeStructuredValue(
@@ -8408,6 +8724,7 @@
   function onInput(event) {
     const target = interactiveTargetFromEvent(event);
     if (!target) return;
+    rememberSiteIdentityCandidate(target, "input");
     rememberRecentValueEvent(target, "input");
     if (!CAPTURE_INTERMEDIATE_INPUT_ROWS) return;
     if (!shouldTrackInputEvent("input", target, event)) return;
@@ -8530,6 +8847,7 @@
   function onSubmit(event) {
     const target = event.target instanceof HTMLFormElement ? event.target : null;
     if (!target) return;
+    markSiteIdentitySubmitted(target, "form_submit");
     const submitter = event.submitter instanceof Element ? event.submitter : null;
     const submitRelation = resolveSubmitRelationReference(Date.now());
     const submitRelationContext = relationContextFromReference(submitRelation, "submit");
@@ -8731,6 +9049,7 @@
       }
       if (popupRelated) schedulePopupLifecycleCheck("mutation");
       if (meaningful) scheduleScreenChangeCheck("mutation");
+      if (meaningful) scheduleSiteIdentityProbe("mutation", 350);
     });
     observer.observe(document.body, {
       childList: true,
@@ -8822,6 +9141,7 @@
     scheduleCprMenuContextRefresh("main_world_injected");
   });
   requestRuntimeConfig();
+  restoreSiteIdentityState();
 
   addEventListener("click", onClick, true);
   addEventListener("change", onChange, true);

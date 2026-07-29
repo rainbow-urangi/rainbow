@@ -7,11 +7,10 @@ const COLLECTOR_KEY_KEY = "collectorKey";
 const COLLECTOR_DEVICE_ID_KEY = "collectorDeviceInstallationId";
 const COLLECTOR_DEVICE_TOKEN_KEY = "collectorDeviceAccessToken";
 const COLLECTOR_DEVICE_TOKEN_EXPIRES_KEY = "collectorDeviceAccessTokenExpiresAtMs";
+const COLLECTOR_BROWSER_SESSION_ID_KEY = "collectorBrowserSessionId";
 const RUNTIME_CONFIG_URL_KEY = "collectorRuntimeConfigUrl";
 const RUNTIME_CONFIG_CACHE_KEY = "AZ_TEST_RUNTIME_CONFIG_CACHE";
 const DEFAULT_RUNTIME_CONFIG_TTL_MS = 5 * 60 * 1000;
-const NETWORK_CONTEXT_TTL_MS = 60 * 1000;
-const NETWORK_NATIVE_HOST = "kr.co.rainbowlab.network_context";
 const QUEUE_FLUSH_ALARM_NAME = "AZ_TEST_QUEUE_FLUSH_WAKE";
 const QUEUE_FLUSH_ALARM_PERIOD_MINUTES = 1;
 const DEBUG_LOG_ALL_UPLOAD_PAYLOADS = false;
@@ -46,6 +45,10 @@ const QUEUE_HARD_MAX_ROWS = MAX_QUEUE_ROWS + MAX_BATCH_ROWS;
 const BASE_UPLOAD_DELAY_MS = 3000;
 const BASE_RETRY_DELAY_MS = 1000;
 const MAX_RETRY_DELAY_MS = 30000;
+const IDENTITY_SESSION_STORAGE_KEY = "RAINBOW_IDENTITY_STATE_BY_TAB";
+const POC_IDENTITY_HOLD_MAX_MS = 5 * 60 * 1000;
+const POC_MANUAL_ID_ENABLED = true;
+const POC_MANUAL_ID_TARGET_ORIGINS = new Set(["http://211.109.22.33:8791"]);
 const CONTENT_SCRIPT_MATCHERS = [
   /^http:\/\/211\.109\.22\.33:8791\//,
   /^https:\/\/rainbowlab\.ai\.kr\/rbem(?:[/?#]|$)/,
@@ -58,9 +61,192 @@ let hydrated = false;
 let flushRequestedWhileInFlight = false;
 let retryAttempt = 0;
 let scheduledUploadReason = "content script가 전달한 수집 데이터를 서버로 전송";
-let networkContextCache = null;
-let networkContextCachedAt = 0;
 const pendingRows = [];
+const identityStateByTab = new Map();
+let identityStateHydrated = false;
+let identityStateMutation = Promise.resolve();
+
+function identityStorageArea() {
+  return chrome.storage.session || chrome.storage.local;
+}
+
+function normalizeSiteIdentitySubject(value) {
+  const normalized = typeof value === "string" ? value.normalize("NFKC").trim() : "";
+  if (!normalized || normalized.length > 128) return null;
+  if (/[\u0000-\u001f\u007f]/.test(normalized)) return null;
+  return normalized;
+}
+
+function pocManualIdentityEnabledForUrl(value) {
+  if (!POC_MANUAL_ID_ENABLED) return false;
+  try {
+    return POC_MANUAL_ID_TARGET_ORIGINS.has(new URL(value).origin);
+  } catch {
+    return false;
+  }
+}
+
+function createPocManualIdentity(value) {
+  const subject = normalizeSiteIdentitySubject(value);
+  if (!subject) return null;
+  return {
+    subject,
+    source: "manual_poc_override",
+    confidence: "poc",
+    resolved_at: new Date().toISOString()
+  };
+}
+
+function safeContextObject(value) {
+  if (!value) return {};
+  if (typeof value === "object" && !Array.isArray(value)) return value;
+  if (typeof value !== "string") return {};
+  try {
+    const parsed = JSON.parse(value);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function normalizedContextText(value, maxLength = 128) {
+  const normalized = typeof value === "string" ? value.trim() : "";
+  if (!normalized || normalized.length > maxLength || /[\u0000-\u001f\u007f]/.test(normalized)) return null;
+  return normalized;
+}
+
+function positiveContextInteger(value) {
+  const number = Number(value);
+  return Number.isInteger(number) && number > 0 ? number : null;
+}
+
+function applyCollectorSessionContext(row, sourceRow = {}, context = {}) {
+  if (!row || typeof row !== "object") return row;
+  const payload = safeContextObject(sourceRow?.payload);
+  const sourceEnvironment = safeContextObject(payload.environment_context);
+  const locators = { ...safeContextObject(row.AZ_locators_json) };
+  const session = { ...safeContextObject(locators.session) };
+  const environment = { ...safeContextObject(locators.env) };
+  const installationId = normalizedContextText(context.installationId);
+  const browserSessionId = normalizedContextText(context.browserSessionId);
+  const tabId = positiveContextInteger(context.tabId ?? sourceRow?.__rainbow_identity_tab_id);
+  const userAgent = normalizedContextText(environment.ua, 2048) ||
+    normalizedContextText(sourceEnvironment.ua, 2048) ||
+    normalizedContextText(context.userAgent, 2048);
+  const viewportWidth = positiveContextInteger(row.AZ_viewport_w) ||
+    positiveContextInteger(environment.vw) || positiveContextInteger(sourceEnvironment.vw);
+  const viewportHeight = positiveContextInteger(row.AZ_viewport_h) ||
+    positiveContextInteger(environment.vh) || positiveContextInteger(sourceEnvironment.vh);
+
+  return {
+    ...row,
+    AZ_session_install_id: normalizedContextText(row.AZ_session_install_id) || installationId,
+    AZ_session_browser_id: normalizedContextText(row.AZ_session_browser_id) || browserSessionId,
+    AZ_session_tab_id: positiveContextInteger(row.AZ_session_tab_id) || tabId,
+    AZ_viewport_w: viewportWidth,
+    AZ_viewport_h: viewportHeight,
+    AZ_locators_json: {
+      ...locators,
+      session: {
+        ...session,
+        install_id: normalizedContextText(session.install_id) || installationId,
+        browser_session_id: normalizedContextText(session.browser_session_id) || browserSessionId,
+        tab_id: positiveContextInteger(session.tab_id) || tabId
+      },
+      env: { ...environment, ua: userAgent, vw: viewportWidth, vh: viewportHeight }
+    }
+  };
+}
+
+function normalizeIdentityContext(value, fallbackSource = "site_authenticated_user") {
+  const subject = normalizeSiteIdentitySubject(value?.subject);
+  if (!subject) return null;
+  return {
+    subject,
+    source: typeof value?.source === "string" && value.source.trim()
+      ? value.source.trim()
+      : fallbackSource,
+    confidence: typeof value?.confidence === "string" && value.confidence.trim()
+      ? value.confidence.trim()
+      : "verified",
+    resolved_at: typeof value?.resolved_at === "string" && value.resolved_at.trim()
+      ? value.resolved_at
+      : new Date().toISOString()
+  };
+}
+
+async function hydrateIdentityState() {
+  if (identityStateHydrated) return;
+  const stored = await identityStorageArea().get(IDENTITY_SESSION_STORAGE_KEY);
+  const values = stored?.[IDENTITY_SESSION_STORAGE_KEY];
+  if (values && typeof values === "object" && !Array.isArray(values)) {
+    for (const [tabId, state] of Object.entries(values)) {
+      const numericTabId = Number(tabId);
+      if (Number.isInteger(numericTabId) && state && typeof state === "object") {
+        identityStateByTab.set(numericTabId, state);
+      }
+    }
+  }
+  identityStateHydrated = true;
+}
+
+async function persistIdentityState() {
+  const values = {};
+  for (const [tabId, state] of identityStateByTab.entries()) values[String(tabId)] = state;
+  await identityStorageArea().set({ [IDENTITY_SESSION_STORAGE_KEY]: values });
+}
+
+function mutateIdentityState(task) {
+  identityStateMutation = identityStateMutation.catch(() => {}).then(async () => {
+    await hydrateIdentityState();
+    const result = await task();
+    await persistIdentityState();
+    return result;
+  });
+  return identityStateMutation;
+}
+
+function effectiveIdentityForTab(tabId) {
+  const state = identityStateByTab.get(tabId) || null;
+  return normalizeIdentityContext(state?.manual, "manual_poc_override") ||
+    normalizeIdentityContext(state?.confirmed, "site_authenticated_user");
+}
+
+function rowTabId(row) {
+  const value = Number(row?.__rainbow_identity_tab_id);
+  return Number.isInteger(value) ? value : null;
+}
+
+function rowIsIdentityHeld(row) {
+  if (row?.__rainbow_identity_hold !== true) return false;
+  const holdUntil = Number(row?.__rainbow_identity_hold_until || 0);
+  return holdUntil <= 0 || Date.now() < holdUntil;
+}
+
+function hasUploadEligibleRows() {
+  return pendingRows.some((row) => !rowIsIdentityHeld(row));
+}
+
+function prepareRowsForIdentity(rows, sender = {}) {
+  const tabId = Number.isInteger(sender?.tab?.id) ? sender.tab.id : null;
+  const tabUrl = sender?.tab?.url || firstSourcePageUrl(rows) || null;
+  const pocEnabled = tabId != null && pocManualIdentityEnabledForUrl(tabUrl);
+  const state = tabId != null ? identityStateByTab.get(tabId) || null : null;
+  const effectiveIdentity = tabId != null ? effectiveIdentityForTab(tabId) : null;
+  const manualIdentity = normalizeIdentityContext(state?.manual, "manual_poc_override");
+  const shouldHold = pocEnabled && !manualIdentity;
+  const holdUntil = shouldHold ? Date.now() + POC_IDENTITY_HOLD_MAX_MS : null;
+
+  return rows.map((row) => ({
+    ...row,
+    ...(tabId != null ? { __rainbow_identity_tab_id: tabId } : {}),
+    ...(effectiveIdentity ? { __rainbow_identity: effectiveIdentity } : {}),
+    ...(shouldHold ? {
+      __rainbow_identity_hold: true,
+      __rainbow_identity_hold_until: holdUntil
+    } : {})
+  }));
+}
 
 function matchesCollectorTarget(url) {
   return typeof url === "string" && CONTENT_SCRIPT_MATCHERS.some((pattern) => pattern.test(url));
@@ -165,6 +351,7 @@ function resolveCollectorKey(url, config) {
 }
 
 let collectorDeviceTokenRequest = null;
+let collectorBrowserSessionIdRequest = null;
 
 function createCollectorDeviceId() {
   if (typeof crypto.randomUUID === "function") return crypto.randomUUID();
@@ -240,58 +427,98 @@ async function readCollectorAuthorization(url, config) {
   return { kind: "device_token", headers: { Authorization: `Bearer ${issuedToken}` } };
 }
 
-function isUsableIpv4(address) {
-  const parts = String(address || "").split(".");
-  if (parts.length !== 4 || parts.some((part) => !/^\d+$/.test(part) || Number(part) > 255)) {
-    return false;
-  }
-  return address !== "0.0.0.0" && !address.startsWith("127.") && !address.startsWith("169.254.");
-}
-
 async function readClientNetworkContext() {
-  if (networkContextCache && Date.now() - networkContextCachedAt < NETWORK_CONTEXT_TTL_MS) {
-    return networkContextCache;
-  }
-
-  let context;
+  const cacheKey = "rainbow_network_context_v1";
+  const cacheTtlMs = 5 * 60 * 1000;
+  const storage = chrome.storage.session || chrome.storage.local;
+  const now = Date.now();
   try {
-    const response = await chrome.runtime.sendNativeMessage(NETWORK_NATIVE_HOST, {
-      type: "get_network_context",
-      collector_version: COLLECTOR_VERSION
-    });
-    if (!response || response.ok !== true) {
-      throw new Error(response?.error || "native_network_host_invalid_response");
-    }
-    const preferredIpv4 = isUsableIpv4(response.preferred_ipv4)
-      ? response.preferred_ipv4
-      : null;
-    const ipv4Interfaces = Array.isArray(response.ipv4_interfaces)
-      ? response.ipv4_interfaces.filter((item) => isUsableIpv4(item?.address))
-      : [];
-    context = {
-      source: "native_messaging_udp_route",
-      collected_at: new Date().toISOString(),
-      preferred_ipv4: preferredIpv4,
-      preferred_interface:
-        typeof response.preferred_interface === "string" ? response.preferred_interface : null,
-      confidence: preferredIpv4 && response.confidence === "high" ? "high" : "unavailable",
-      ipv4_interfaces: ipv4Interfaces,
-      native_host_version: response.native_host_version || null
-    };
-  } catch (error) {
-    context = {
-      source: "native_messaging_udp_route",
-      collected_at: new Date().toISOString(),
-      preferred_ipv4: null,
-      preferred_interface: null,
-      confidence: "unavailable",
-      ipv4_interfaces: [],
-      error: String(error?.message || error)
-    };
-  }
+    const stored = await storage.get(cacheKey);
+    const cached = stored?.[cacheKey];
+    if (cached?.expires_at > now && cached?.value) return cached.value;
+  } catch {}
 
-  networkContextCache = context;
-  networkContextCachedAt = Date.now();
+  const ipv4Parts = (value) => {
+    const parts = typeof value === "string" ? value.trim().split(".").map(Number) : [];
+    return parts.length === 4 &&
+      parts.every((part) => Number.isInteger(part) && part >= 0 && part <= 255)
+      ? parts
+      : null;
+  };
+  const isPrivateIpv4 = (value) => {
+    const parts = ipv4Parts(value);
+    if (!parts) return false;
+    const [a, b] = parts;
+    return a === 10 || (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168);
+  };
+  const isPublicIpv4 = (value) => {
+    const parts = ipv4Parts(value);
+    if (!parts || isPrivateIpv4(value)) return false;
+    const [a, b] = parts;
+    return a !== 0 && a !== 127 && a < 224 &&
+      !(a === 100 && b >= 64 && b <= 127) &&
+      !(a === 169 && b === 254);
+  };
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 2500);
+  const publicIpRequest = fetch("https://api.ipify.org?format=json", {
+    cache: "no-store",
+    credentials: "omit",
+    signal: controller.signal
+  }).then(async (response) => {
+    if (!response.ok) return null;
+    const payload = await response.json();
+    return isPublicIpv4(payload?.ip) ? payload.ip.trim() : null;
+  }).catch(() => null).finally(() => clearTimeout(timeoutId));
+
+  const interfaceRequest =
+    typeof chrome.system?.network?.getNetworkInterfaces === "function"
+      ? chrome.system.network.getNetworkInterfaces().catch(() => [])
+      : Promise.resolve([]);
+  const [publicIpv4, interfaces] = await Promise.all([publicIpRequest, interfaceRequest]);
+  const virtualAdapterPattern =
+    /vmware|virtual|vbox|hyper-v|zerotier|tailscale|wireguard|vpn|wsl|docker|bluetooth|vethernet/i;
+  const physicalAdapterPattern = /wi-?fi|wireless|wlan|ethernet|이더넷|무선/i;
+  const privateInterfaces = interfaces.map((item) => ({
+    address: typeof item?.address === "string" ? item.address.trim() : "",
+    prefix_length: Number(item?.prefixLength),
+    adapter_class: virtualAdapterPattern.test(String(item?.name || ""))
+      ? "virtual"
+      : (physicalAdapterPattern.test(String(item?.name || "")) ? "physical" : "unknown")
+  })).filter((item) =>
+    isPrivateIpv4(item.address) &&
+    Number.isInteger(item.prefix_length) &&
+    item.prefix_length >= 1 && item.prefix_length <= 32
+  ).slice(0, 16);
+  const privateIpv4Candidates = [...new Set(privateInterfaces.map((item) => item.address))];
+  const physicalCandidates = [...new Set(privateInterfaces
+    .filter((item) => item.adapter_class === "physical")
+    .map((item) => item.address))];
+  const privateIpv4 = physicalCandidates.length === 1
+    ? physicalCandidates[0]
+    : (privateIpv4Candidates.length === 1 ? privateIpv4Candidates[0] : null);
+  const context = {
+    source: "chrome_extension_network",
+    collected_at: new Date(now).toISOString(),
+    preferred_ipv4: publicIpv4,
+    public_ipv4: publicIpv4,
+    private_ipv4: privateIpv4,
+    private_ipv4_candidates: privateIpv4Candidates,
+    private_ip_selection: privateIpv4
+      ? (physicalCandidates.length === 1 ? "single_physical_candidate" : "single_candidate")
+      : (privateIpv4Candidates.length > 1 ? "ambiguous_candidates" : "unavailable"),
+    public_ip_source: publicIpv4 ? "ipify" : "unavailable",
+    private_ip_source: privateIpv4Candidates.length ? "chrome_system_network" : "unavailable",
+    confidence: publicIpv4 ? "high" : (privateIpv4 ? "private_only" : "unavailable"),
+    ipv4_interfaces: privateInterfaces
+  };
+  try {
+    await storage.set({
+      [cacheKey]: { expires_at: now + cacheTtlMs, value: context }
+    });
+  } catch {}
   return context;
 }
 
@@ -560,11 +787,53 @@ function attachNetworkContext(row, networkContext) {
   };
 }
 
-function normalizeRowsForUpload(rows, ingestUrl, networkContext) {
+async function getCollectorBrowserSessionId() {
+  if (collectorBrowserSessionIdRequest) return collectorBrowserSessionIdRequest;
+  collectorBrowserSessionIdRequest = (async () => {
+    const storage = chrome.storage.session || chrome.storage.local;
+    const stored = await storage.get(COLLECTOR_BROWSER_SESSION_ID_KEY);
+    const current = stored?.[COLLECTOR_BROWSER_SESSION_ID_KEY];
+    if (typeof current === "string" && current.length >= 16) return current;
+    const created = createCollectorDeviceId().replace(/^install-/, "browser-");
+    await storage.set({ [COLLECTOR_BROWSER_SESSION_ID_KEY]: created });
+    return created;
+  })().finally(() => {
+    collectorBrowserSessionIdRequest = null;
+  });
+  return collectorBrowserSessionIdRequest;
+}
+
+function attachIdentityContext(row, sourceRow) {
+  if (!row || typeof row !== "object") return row;
+  const identity = normalizeIdentityContext(sourceRow?.__rainbow_identity);
+  if (!identity) return row;
+
+  let locators = row.AZ_locators_json;
+  if (typeof locators === "string") {
+    try { locators = JSON.parse(locators); } catch { locators = {}; }
+  }
+  if (!locators || typeof locators !== "object" || Array.isArray(locators)) locators = {};
+
+  return {
+    ...row,
+    AZ_login_id: identity.subject,
+    AZ_locators_json: {
+      ...locators,
+      identity_context: identity
+    }
+  };
+}
+
+function normalizeRowsForUpload(rows, ingestUrl, networkContext, collectorContext = {}) {
   if (!Array.isArray(rows)) return [];
-  return rows.map((row) =>
-    attachNetworkContext(normalizeRowForCollector(row, ingestUrl), networkContext)
-  );
+  return rows.map((row) => {
+    const normalized = normalizeRowForCollector(row, ingestUrl);
+    const withSessionContext = applyCollectorSessionContext(normalized, row, {
+      ...collectorContext,
+      tabId: rowTabId(row)
+    });
+    return attachNetworkContext(attachIdentityContext(withSessionContext, row), networkContext);
+  });
 }
 
 function buildQueueOverflowDiagnosticRow(droppedRowsCount) {
@@ -675,6 +944,7 @@ function takeUploadBatch() {
 
   const batch = [];
   for (const row of pendingRows) {
+    if (rowIsIdentityHeld(row)) continue;
     if (batch.length >= MAX_BATCH_ROWS) break;
     const nextBatch = batch.concat(row);
     const nextBytes = estimateBatchBytes(nextBatch);
@@ -684,6 +954,13 @@ function takeUploadBatch() {
   }
 
   return batch;
+}
+
+function removeUploadedRows(rows) {
+  const uploaded = new Set(rows);
+  for (let index = pendingRows.length - 1; index >= 0; index -= 1) {
+    if (uploaded.has(pendingRows[index])) pendingRows.splice(index, 1);
+  }
 }
 
 function computeRetryDelay(attempt) {
@@ -753,11 +1030,13 @@ function hasImmediateFlushRow(rows) {
   return rows.some((row) => row?.action === "page_close");
 }
 
-async function enqueueRows(rows) {
+async function enqueueRows(rows, sender = {}) {
   if (!Array.isArray(rows) || rows.length === 0) return;
+  await hydrateIdentityState();
   await hydrateQueue();
-  pendingRows.push(...rows);
-  const hasImmediateRow = hasImmediateFlushRow(rows);
+  const preparedRows = prepareRowsForIdentity(rows, sender);
+  pendingRows.push(...preparedRows);
+  const hasImmediateRow = hasImmediateFlushRow(preparedRows);
   const shouldFlushImmediately = hasImmediateRow || pendingRows.length >= QUEUE_URGENT_FLUSH_ROWS;
   if (shouldFlushImmediately) {
     console.info("[Rainbow Collector] 즉시 서버 전송을 시작합니다", {
@@ -985,12 +1264,14 @@ async function flushUpload() {
   await hydrateQueue();
   if (uploadInFlight || pendingRows.length === 0) return;
 
+  const rows = takeUploadBatch();
+  if (rows.length === 0) return;
+
   uploadInFlight = true;
   flushRequestedWhileInFlight = false;
   const uploadReason = scheduledUploadReason || "전송 대기 중인 데이터를 서버로 전송";
   scheduledUploadReason = "전송 대기 중인 데이터를 서버로 전송";
   const pendingBefore = pendingRows.length;
-  const rows = takeUploadBatch();
   let config = null;
   let ingestUrl = DEFAULT_INGEST_URL;
   let uploadRows = [];
@@ -1001,8 +1282,16 @@ async function flushUpload() {
   try {
     config = await readCollectorConfig();
     ingestUrl = resolveIngestUrl(rows, config);
-    const networkContext = await readClientNetworkContext();
-    uploadRows = normalizeRowsForUpload(rows, ingestUrl, networkContext);
+    const [networkContext, installationId, browserSessionId] = await Promise.all([
+      readClientNetworkContext(),
+      getCollectorDeviceId(),
+      getCollectorBrowserSessionId()
+    ]);
+    uploadRows = normalizeRowsForUpload(rows, ingestUrl, networkContext, {
+      installationId,
+      browserSessionId,
+      userAgent: globalThis.navigator?.userAgent || null
+    });
     if (uploadRows.length === 0) return;
     collectorAuthorization = await readCollectorAuthorization(ingestUrl, config);
     const uploadPayload = { rows: uploadRows, ts: Date.now() };
@@ -1029,10 +1318,10 @@ async function flushUpload() {
       throw new Error(`ingest_failed_${response.status}`);
     }
 
-    pendingRows.splice(0, rows.length);
+    removeUploadedRows(rows);
     await persistQueue();
     retryAttempt = 0;
-    shouldContinue = pendingRows.length > 0;
+    shouldContinue = hasUploadEligibleRows();
     if (DEBUG_LOG_ALL_UPLOAD_PAYLOADS) {
       console.info("[Rainbow Collector] 서버 전송 성공", {
         "전송 row 수": uploadRows.length,
@@ -1352,21 +1641,43 @@ function installMainWorldBridge(bridgeNonce) {
     return hints.filter(Boolean);
   };
 
-  const findCprMenuRow = (rows, hints) => {
+  const findCprMenuRow = (rows, hints, pathHint = []) => {
     const compactHints = hints.map(compactCprKey).filter(Boolean);
-    if (!compactHints.length) return null;
+    const wantedPath = splitCprPath(pathHint).map(compactCprKey);
+    const valuesOf = (row) => [
+      row.MENU_ID,
+      row.PGM_ID,
+      row.MENU_KEY,
+      row.CALL_PAGE,
+      row.MENU_NM
+    ].map(compactCprKey).filter(Boolean);
+    const suffixScore = (row) => {
+      const actual = splitCprPath(row.MENU_PATH).map(compactCprKey);
+      let score = 0;
+      for (
+        let actualIndex = actual.length - 1, wantedIndex = wantedPath.length - 1;
+        actualIndex >= 0 && wantedIndex >= 0 && actual[actualIndex] === wantedPath[wantedIndex];
+        actualIndex -= 1, wantedIndex -= 1
+      ) {
+        score += 1;
+      }
+      return score;
+    };
+
     for (const hint of compactHints) {
-      const matched = rows.find((row) => {
-        const values = [
-          row.MENU_ID,
-          row.PGM_ID,
-          row.MENU_KEY,
-          row.CALL_PAGE,
-          row.MENU_NM
-        ].map(compactCprKey).filter(Boolean);
-        return values.some((value) => value === hint || value.includes(hint) || hint.includes(value));
-      });
-      if (matched) return matched;
+      const exact = rows.filter((row) => valuesOf(row).some((value) => value === hint));
+      if (exact.length === 1) return exact[0];
+      if (exact.length > 1) {
+        const ranked = exact
+          .map((row) => ({ row, score: suffixScore(row) }))
+          .sort((a, b) => b.score - a.score);
+        return ranked[0].score > (ranked[1]?.score ?? -1) ? ranked[0].row : null;
+      }
+    }
+    for (const hint of compactHints) {
+      const fuzzy = rows.filter((row) => valuesOf(row)
+        .some((value) => value.includes(hint) || hint.includes(value)));
+      if (fuzzy.length === 1) return fuzzy[0];
     }
     return null;
   };
@@ -1386,10 +1697,15 @@ function installMainWorldBridge(bridgeNonce) {
       detail.programId,
       detail.pgm_id,
       detail.PGM_ID,
+      detail.clicked_label,
+      detail.selected_label,
+      ...splitCprPath(detail.clicked_path).slice(-1),
       ...cprApiHints(detail.api_url)
     ].filter(Boolean);
     const selectedHints = collectCprSelectedHints(mainApp);
-    const menuRow = findCprMenuRow(rows, [...explicitHints, ...selectedHints]);
+    const menuRow = explicitHints.length > 0
+      ? findCprMenuRow(rows, explicitHints, detail.clicked_path || detail.selected_path || [])
+      : findCprMenuRow(rows, selectedHints);
     if (!menuRow) {
       return {
         source: "cpr_runtime",
@@ -1935,6 +2251,165 @@ function installMainWorldBridge(bridgeNonce) {
   });
 }
 
+async function setIdentityBadge(tabId, visible) {
+  if (!chrome.action || !Number.isInteger(tabId)) return;
+  try {
+    await chrome.action.setBadgeBackgroundColor({ tabId, color: "#1769aa" });
+    await chrome.action.setBadgeText({ tabId, text: visible ? "ID" : "" });
+  } catch {}
+}
+
+async function applyIdentityToQueuedRows(tabId, identity = null, releaseHeld = true) {
+  if (!Number.isInteger(tabId)) return 0;
+  await hydrateQueue();
+  let changed = 0;
+  for (const row of pendingRows) {
+    if (rowTabId(row) !== tabId) continue;
+    if (identity) row.__rainbow_identity = identity;
+    if (releaseHeld) {
+      delete row.__rainbow_identity_hold;
+      delete row.__rainbow_identity_hold_until;
+    }
+    changed += 1;
+  }
+  if (changed > 0) {
+    await persistQueue();
+    if (releaseHeld) scheduleUpload(0, "사용자 ID가 확인되어 대기 중인 데이터를 전송");
+  }
+  return changed;
+}
+
+async function recordSiteIdentityCandidate(message, sender) {
+  const tabId = sender?.tab?.id;
+  const subject = normalizeSiteIdentitySubject(message?.subject);
+  if (!Number.isInteger(tabId) || !subject) return { ok: false, error: "invalid_identity_candidate" };
+
+  let shouldOpenPoc = false;
+  await mutateIdentityState(() => {
+    const state = identityStateByTab.get(tabId) || {};
+    state.candidate = {
+      subject,
+      source: "login_form_candidate",
+      confidence: "candidate",
+      observed_at: new Date().toISOString(),
+      page_session_id: message?.pageSessionId || null
+    };
+    const pocEnabled = pocManualIdentityEnabledForUrl(sender?.tab?.url || message?.pageUrl || "");
+    shouldOpenPoc = pocEnabled && !state.manual && !state.poc_prompted;
+    if (shouldOpenPoc) state.poc_prompted = true;
+    identityStateByTab.set(tabId, state);
+  });
+
+  if (shouldOpenPoc) {
+    await setIdentityBadge(tabId, true);
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: "POC_MANUAL_ID_PROMPT" }, { frameId: 0 });
+    } catch {}
+  }
+  return { ok: true, poc_prompted: shouldOpenPoc };
+}
+
+async function recordSiteIdentitySubmitted(message, sender) {
+  const tabId = sender?.tab?.id;
+  if (!Number.isInteger(tabId)) return { ok: false };
+  await mutateIdentityState(() => {
+    const state = identityStateByTab.get(tabId) || {};
+    state.submitted_at = new Date().toISOString();
+    state.submitted_page_session_id = message?.pageSessionId || null;
+    identityStateByTab.set(tabId, state);
+  });
+  return { ok: true };
+}
+
+async function recordSiteIdentityLoginResponse(message, sender) {
+  const tabId = sender?.tab?.id;
+  const status = Number(message?.status);
+  if (!Number.isInteger(tabId) || !Number.isFinite(status) || status < 200 || status >= 400) {
+    return { ok: false };
+  }
+  await mutateIdentityState(() => {
+    const state = identityStateByTab.get(tabId) || {};
+    state.login_response_at = new Date().toISOString();
+    state.login_response_url = typeof message?.url === "string" ? message.url.slice(0, 2048) : null;
+    state.login_response_status = status;
+    identityStateByTab.set(tabId, state);
+  });
+  return { ok: true };
+}
+
+async function confirmSiteIdentity(message, sender) {
+  const tabId = sender?.tab?.id;
+  if (!Number.isInteger(tabId)) return { ok: false, error: "invalid_tab" };
+  let confirmedIdentity = null;
+  await mutateIdentityState(() => {
+    const state = identityStateByTab.get(tabId) || {};
+    const subject = normalizeSiteIdentitySubject(message?.subject || state?.candidate?.subject);
+    if (!subject) return;
+    confirmedIdentity = normalizeIdentityContext({
+      subject,
+      source: "site_authenticated_user",
+      confidence: message?.confidence || "verified",
+      resolved_at: new Date().toISOString()
+    });
+    state.confirmed = confirmedIdentity;
+    identityStateByTab.set(tabId, state);
+  });
+  if (!confirmedIdentity) return { ok: false, error: "identity_candidate_missing" };
+
+  const pocEnabled = pocManualIdentityEnabledForUrl(sender?.tab?.url || message?.pageUrl || "");
+  const state = identityStateByTab.get(tabId) || {};
+  await applyIdentityToQueuedRows(
+    tabId,
+    effectiveIdentityForTab(tabId),
+    !pocEnabled || Boolean(state.manual)
+  );
+  return { ok: true };
+}
+
+async function getSiteIdentityStatus(sender) {
+  const tabId = sender?.tab?.id;
+  if (!Number.isInteger(tabId)) return { ok: false };
+  await hydrateIdentityState();
+  const state = identityStateByTab.get(tabId) || {};
+  return {
+    ok: true,
+    candidate: state.candidate || null,
+    identity: effectiveIdentityForTab(tabId),
+    submitted_at: state.submitted_at || null,
+    login_response_at: state.login_response_at || null
+  };
+}
+
+async function getPocManualIdentity(message, sender = {}) {
+  const tabId = Number.isInteger(sender?.tab?.id) ? sender.tab.id : Number(message?.tabId);
+  if (!Number.isInteger(tabId)) return { ok: false };
+  await hydrateIdentityState();
+  const state = identityStateByTab.get(tabId) || {};
+  return {
+    ok: true,
+    identity: normalizeIdentityContext(state.manual, "manual_poc_override")
+  };
+}
+
+async function setPocManualIdentity(message, sender = {}) {
+  const tabId = Number.isInteger(sender?.tab?.id) ? sender.tab.id : Number(message?.tabId);
+  const tab = Number.isInteger(tabId) ? await chrome.tabs.get(tabId).catch(() => null) : null;
+  if (!tab || !pocManualIdentityEnabledForUrl(tab.url || "")) {
+    return { ok: false, error: "poc_not_enabled_for_tab" };
+  }
+  const identity = createPocManualIdentity(message?.subject);
+  if (!identity) return { ok: false, error: "invalid_manual_id" };
+
+  await mutateIdentityState(() => {
+    const state = identityStateByTab.get(tabId) || {};
+    state.manual = identity;
+    identityStateByTab.set(tabId, state);
+  });
+  await applyIdentityToQueuedRows(tabId, identity);
+  await setIdentityBadge(tabId, false);
+  return { ok: true, identity };
+}
+
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message?.type === "GET_RUNTIME_CONFIG") {
     void readRuntimeConfigForPage(message.pageUrl || sender?.tab?.url || null)
@@ -1952,9 +2427,45 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message?.type === "BATCH_ROWS") {
-    void enqueueRows(message.rows || []).then(() => {
+    void enqueueRows(message.rows || [], sender).then(() => {
       sendResponse?.({ ok: true, count: message.rows?.length || 0 });
     });
+    return true;
+  }
+
+  if (message?.type === "SITE_IDENTITY_CANDIDATE") {
+    void recordSiteIdentityCandidate(message, sender).then(sendResponse);
+    return true;
+  }
+
+  if (message?.type === "SITE_IDENTITY_SUBMITTED") {
+    void recordSiteIdentitySubmitted(message, sender).then(sendResponse);
+    return true;
+  }
+
+
+  if (message?.type === "SITE_IDENTITY_LOGIN_RESPONSE") {
+    void recordSiteIdentityLoginResponse(message, sender).then(sendResponse);
+    return true;
+  }
+
+  if (message?.type === "SITE_IDENTITY_CONFIRMED") {
+    void confirmSiteIdentity(message, sender).then(sendResponse);
+    return true;
+  }
+
+  if (message?.type === "SITE_IDENTITY_STATUS_GET") {
+    void getSiteIdentityStatus(sender).then(sendResponse);
+    return true;
+  }
+
+  if (message?.type === "POC_MANUAL_ID_GET") {
+    void getPocManualIdentity(message, sender).then(sendResponse);
+    return true;
+  }
+
+  if (message?.type === "POC_MANUAL_ID_SET") {
+    void setPocManualIdentity(message, sender).then(sendResponse);
     return true;
   }
 
@@ -1988,6 +2499,34 @@ chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
   if (changeInfo.status !== "complete") return;
   if (!matchesCollectorTarget(tab.url)) return;
   void injectCollectorScript(tabId);
+});
+
+chrome.action.onClicked.addListener((tab) => {
+  const tabId = tab?.id;
+  if (!Number.isInteger(tabId) || !pocManualIdentityEnabledForUrl(tab?.url || "")) return;
+  void (async () => {
+    await hydrateIdentityState();
+    const state = identityStateByTab.get(tabId) || {};
+    if (state.manual) {
+      await setIdentityBadge(tabId, false);
+      return;
+    }
+    await setIdentityBadge(tabId, true);
+    try {
+      await chrome.tabs.sendMessage(tabId, { type: "POC_MANUAL_ID_PROMPT" }, { frameId: 0 });
+    } catch {}
+  })();
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  void (async () => {
+    await hydrateIdentityState();
+    const fallbackIdentity = effectiveIdentityForTab(tabId);
+    await applyIdentityToQueuedRows(tabId, fallbackIdentity);
+    await mutateIdentityState(() => {
+      identityStateByTab.delete(tabId);
+    });
+  })();
 });
 
 chrome.runtime.onInstalled.addListener(() => {

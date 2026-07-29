@@ -1,12 +1,13 @@
 {
   "manifest_version": 3,
   "name": "Rainbow Collector Extension",
-  "version": "0.1.14",
+  "version": "0.1.19",
   "description": "Browser workflow collector.",
-  "permissions": ["storage", "tabs", "scripting", "alarms", "nativeMessaging"],
+  "permissions": ["storage", "tabs", "scripting", "alarms", "system.network"],
   "host_permissions": [
     "http://211.109.22.33:8791/*",
-    "https://rainbowlab.ai.kr/*"
+    "https://rainbowlab.ai.kr/*",
+    "https://api.ipify.org/*"
   ],
   "background": {
     "service_worker": "background.js"
