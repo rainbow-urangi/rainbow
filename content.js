@@ -32,6 +32,7 @@
   let eventSequence = 0;
   let activeMenuContext = null;
   let activeCprDomMenuPath = [];
+  let activeCprTopMenuPath = [];
   let activeCprMenuContext = null;
   let activeCprMenuContextUpdatedAt = 0;
   let cprMenuContextRefreshTimer = null;
@@ -54,6 +55,9 @@
   const MAX_CONTEXT_CANDIDATES = 3;
   const MAX_DEBUG_CANDIDATES = 3;
   const MAX_GRID_ROW_FIELDS = 30;
+  const MAX_SEMANTIC_TEXT_CHARS = 200;
+  const CONTEXT_SCHEMA_VERSION = 2;
+  const TEXT_CONTEXT_VERSION = 2;
   const GRID_ADAPTER_TIMEOUT_MS = 50;
   const INTERNAL_GRID_ADAPTER_TIMEOUT_MS = 150;
   const LATE_GRID_ADAPTER_TIMEOUT_MS = 1500;
@@ -218,6 +222,18 @@
       ".cl-dialog",
       ".cl-window"
     ].join(",");
+  const UI_OUTCOME_SELECTOR = [
+    "[role='alert']",
+    "[role='status']",
+    "[aria-live]",
+    ".toast",
+    ".alert",
+    ".invalid-feedback",
+    ".validation-message",
+    ".error-message",
+    "[data-validation-message]",
+    "[aria-invalid='true']"
+  ].join(",");
   const VALUE_REFLECTION_WINDOW_MS = 1500;
   const VALUE_REFLECTION_CHECK_DELAYS_MS = [80, 250, 700, 1400];
   const VALUE_REFLECTION_MAX_CANDIDATES = 80;
@@ -1862,6 +1878,9 @@
   function detectSensitiveKind(value, key, el) {
     const hint = `${String(key || "")} ${fieldHintText(el)}`.toLowerCase();
     if (el && isLoginIdentifierInput(el)) return "identity";
+    if (/(stud(?:ent)?[_-]?(?:id|no|nm|name)|birthday|birth[_-]?date|gender|resident|ssn|jumin|person[_-]?(?:id|name)|학번|학생번호|생년|성별|성명|주민|연락처|전화번호)/i.test(hint)) {
+      return "identity";
+    }
     if (/(password|passwd|pwd|secret|token|bearer|authorization|auth|api[_-]?key|session|cookie|otp|pin)/i.test(hint)) {
       return "secret";
     }
@@ -1918,7 +1937,7 @@
   }
 
   function isSensitiveDataKey(key) {
-    return /(password|passwd|pwd|secret|token|authorization|cookie|session|api[_-]?key|request_?body|response_?body|value|pasted_text|input_value)/i.test(String(key || ""));
+    return /(password|passwd|pwd|secret|token|authorization|cookie|session|api[_-]?key|request_?body|response_?body|value|pasted_text|input_value|stud(?:ent)?[_-]?(?:id|no|nm|name)|birthday|birth[_-]?date|gender|resident|ssn|jumin|person[_-]?(?:id|name)|학번|학생번호|생년|성별|성명|주민)/i.test(String(key || ""));
   }
 
   function isSensitiveBodyKey(key) {
@@ -1979,6 +1998,116 @@
     }
 
     return value;
+  }
+
+  function sanitizeGridValue(value, fieldKey, element = null) {
+    return sanitizeStructuredValue(value, {
+      key: String(fieldKey || "cell_value"),
+      element
+    });
+  }
+
+  function sanitizeGridRowData(value) {
+    if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+    return Object.fromEntries(Object.entries(limitObjectEntries(value, MAX_GRID_ROW_FIELDS))
+      .map(([key, entryValue]) => [key, sanitizeGridValue(entryValue, key)]));
+  }
+
+  function sanitizeGridRowContext(rowContext, rowCandidatePairs = []) {
+    if (!rowContext || typeof rowContext !== "object") return rowContext;
+    const candidates = Array.isArray(rowContext.candidates) ? rowContext.candidates : [];
+    const sourcePairs = [...(Array.isArray(rowCandidatePairs) ? rowCandidatePairs : []), ...candidates];
+    const keyForValue = (value) => {
+      const match = sourcePairs.find((candidate) =>
+        candidate?.key && String(candidate?.value ?? "") === String(value ?? "")
+      );
+      return match?.key || null;
+    };
+    const sanitizedPath = Array.isArray(rowContext.row_path)
+      ? rowContext.row_path.map((value) => {
+          const key = keyForValue(value);
+          return key ? sanitizeGridValue(value, key) : "[UNRESOLVED_ROW_VALUE]";
+        })
+      : rowContext.row_path;
+    const sanitizedCandidates = candidates.map((candidate) => ({
+      ...candidate,
+      value: candidate?.key
+        ? sanitizeGridValue(candidate.value, candidate.key)
+        : "[UNRESOLVED_ROW_VALUE]"
+    }));
+    return {
+      ...rowContext,
+      row_path: sanitizedPath,
+      row_label: Array.isArray(sanitizedPath) && sanitizedPath.length > 0 ? sanitizedPath.join(" > ") : null,
+      values: sanitizeGridRowData(rowContext.values),
+      map: sanitizeGridRowData(rowContext.map),
+      row_data: sanitizeGridRowData(rowContext.row_data),
+      candidates: sanitizedCandidates
+    };
+  }
+
+  function sanitizeStructuredGridRow(row) {
+    if (!row || typeof row !== "object") return row;
+    const sourceCells = Array.isArray(row.cells) ? row.cells : [];
+    const cells = sourceCells.map((cell) => ({
+      ...cell,
+      value: sanitizeGridValue(cell?.value, cell?.label || cell?.column_key || "cell_value")
+    }));
+    const sanitizedPath = Array.isArray(row.row_path)
+      ? row.row_path.map((value) => {
+          const sourceCell = sourceCells.find((cell) => String(cell?.value ?? "") === String(value ?? ""));
+          return sourceCell
+            ? sanitizeGridValue(value, sourceCell.label || sourceCell.column_key || "row_value")
+            : "[UNRESOLVED_ROW_VALUE]";
+        })
+      : row.row_path;
+    return {
+      ...row,
+      row_path: sanitizedPath,
+      row_label: Array.isArray(sanitizedPath) && sanitizedPath.length > 0 ? sanitizedPath.join(" > ") : null,
+      cells
+    };
+  }
+
+  function sanitizeGridRowPath(values, gridContext = null) {
+    if (!Array.isArray(values)) return values;
+    const rowCandidates = [
+      ...(Array.isArray(gridContext?.row_candidate_pairs) ? gridContext.row_candidate_pairs : []),
+      ...(Array.isArray(gridContext?.row_context?.candidates) ? gridContext.row_context.candidates : [])
+    ];
+    return values.map((entry) => {
+      const match = rowCandidates.find((candidate) =>
+        candidate?.key && String(candidate?.value ?? "") === String(entry ?? "")
+      );
+      return match?.key ? sanitizeGridValue(entry, match.key) : "[UNRESOLVED_ROW_VALUE]";
+    });
+  }
+
+  function sanitizeGridSnapshotValues(value, fieldKey, element = null, gridContext = null, path = []) {
+    if (Array.isArray(value)) {
+      return value.map((entry, index) => sanitizeGridSnapshotValues(entry, fieldKey, element, gridContext, [...path, index]));
+    }
+    if (!value || typeof value !== "object") return value;
+    const inExtra = path.includes("extra");
+    const clickedRowPath = inExtra && Array.isArray(value.clicked_row_path)
+      ? sanitizeGridRowPath(value.clicked_row_path, gridContext)
+      : null;
+    const rowPath = inExtra && Array.isArray(value.row_path)
+      ? sanitizeGridRowPath(value.row_path, gridContext)
+      : null;
+    return Object.fromEntries(Object.entries(value).map(([key, entryValue]) => {
+      if (/^(?:clicked_?value|cell_value)$/i.test(key)) {
+        return [key, sanitizeGridValue(entryValue, fieldKey, element)];
+      }
+      if (inExtra && key === "clicked_row_path" && clickedRowPath) return [key, clickedRowPath];
+      if (inExtra && key === "clicked_row_label" && clickedRowPath) return [key, clickedRowPath.join(" > ") || null];
+      if (inExtra && key === "row_path" && rowPath) return [key, rowPath];
+      if (inExtra && key === "row_label" && rowPath) return [key, rowPath.join(" > ") || null];
+      if (/^(?:row_data|clicked_row)$/i.test(key) && entryValue && typeof entryValue === "object") {
+        return [key, sanitizeGridRowData(entryValue)];
+      }
+      return [key, sanitizeGridSnapshotValues(entryValue, fieldKey, element, gridContext, [...path, key])];
+    }));
   }
 
   function isTrackedUserAction(action) {
@@ -2275,6 +2404,15 @@
     return [];
   }
 
+  function normalizeMenuPathParts(value) {
+    const source = Array.isArray(value)
+      ? value
+      : typeof value === "string"
+        ? value.split(/\s*(?:>|›|»|→)\s*/)
+        : [];
+    return source.map((part) => String(part || "").trim()).filter(Boolean);
+  }
+
   function looksRowDimensionHeader(label) {
     return /품종|제품명|품목|품명|상품|제품|코드|code|id|no|번호|이름|name|명칭|거래처|고객|업체|부서|팀|담당자|사용자|메뉴|프로그램/i.test(String(label || ""));
   }
@@ -2487,7 +2625,9 @@
 
   function normalizeMenuContextCandidate(candidate) {
     if (!candidate) return null;
-    const path = normalizePathParts(candidate.path || candidate.selected_path || candidate.selectedPath);
+    const path = normalizeMenuPathParts(
+      candidate.path || candidate.selected_path || candidate.selectedPath || candidate.path_text || candidate.selected_path_text
+    );
     const pathText =
       candidate.path_text ||
       candidate.selected_path_text ||
@@ -2721,7 +2861,7 @@
 
   function enrichMenuContext(context) {
     if (!context) return null;
-    const path = normalizePathParts(context.path || context.selected_path);
+    const path = normalizeMenuPathParts(context.path || context.selected_path || context.path_text || context.selected_path_text);
     const pathText = context.path_text || context.selected_path_text || context.pathText || path.join(" > ") || null;
     return {
       ...context,
@@ -2736,13 +2876,13 @@
 
   function normalizeCprMenuPathParts(value) {
     if (Array.isArray(value)) {
-      return dedupeOrderedParts(value.flatMap((part) => normalizeCprMenuPathParts(part)));
+      return value.flatMap((part) => normalizeCprMenuPathParts(part));
     }
     if (typeof value === "string" && value.trim()) {
-      return dedupeOrderedParts(value
+      return value
         .split(/\s*(?:>|›|»)\s*/)
         .map((part) => part.trim())
-        .filter(Boolean));
+        .filter(Boolean);
     }
     return [];
   }
@@ -2853,10 +2993,16 @@
   }
 
   function mergeMenuPaths(leftPath, rightPath) {
-    return dedupeOrderedParts([
-      ...normalizePathParts(leftPath),
-      ...normalizePathParts(rightPath)
-    ]).slice(-4);
+    const left = normalizeMenuPathParts(leftPath);
+    const right = normalizeMenuPathParts(rightPath);
+    let overlap = Math.min(left.length, right.length);
+    while (overlap > 0) {
+      const suffix = left.slice(left.length - overlap);
+      const prefix = right.slice(0, overlap);
+      if (suffix.every((part, index) => part === prefix[index])) break;
+      overlap -= 1;
+    }
+    return [...left, ...right.slice(overlap)].slice(-6);
   }
 
   function resolveBreadcrumbMenuCandidate(options = {}) {
@@ -3068,8 +3214,8 @@
   }
 
   function menuPathsCompatible(left, right) {
-    const a = normalizePathParts(left?.path || left?.selected_path);
-    const b = normalizePathParts(right?.path || right?.selected_path);
+    const a = normalizeMenuPathParts(left?.path || left?.selected_path || left?.path_text || left?.selected_path_text);
+    const b = normalizeMenuPathParts(right?.path || right?.selected_path || right?.path_text || right?.selected_path_text);
     if (!a.length || !b.length) return false;
     if (a[a.length - 1] === b[b.length - 1]) return true;
     const short = a.length <= b.length ? a : b;
@@ -3079,8 +3225,11 @@
   }
 
   function cprMenuCandidateScore(context) {
-    return activeMenuContext?.selected_path_text &&
-      !menuPathsCompatible(activeMenuContext, context) ? 7 : 12;
+    if (!activeMenuContext?.selected_path_text) return 12;
+    if (!menuPathsCompatible(activeMenuContext, context)) return 7;
+    const activeDepth = normalizeMenuPathParts(activeMenuContext.path || activeMenuContext.selected_path).length;
+    const cprDepth = normalizeMenuPathParts(context?.path || context?.selected_path).length;
+    return cprDepth > activeDepth ? 12 : 10;
   }
 
   function chooseActiveAndCprMenuContext(context) {
@@ -3171,6 +3320,7 @@
 
   function resetActiveMenuContext(reason = "manual_reset") {
     activeCprDomMenuPath = [];
+    activeCprTopMenuPath = [];
     if (!activeMenuContext) return false;
     activeMenuContext = null;
     return true;
@@ -3200,7 +3350,7 @@
     if (!context) return null;
     const columnPath = normalizePathParts(context.column_path || context.col_path);
     const rowContextValues = context.row_context?.values || context.row_context?.map || context.row_context_map || null;
-    return {
+    const enriched = {
       ...context,
       detected: true,
       promoted: context.promoted ?? true,
@@ -3215,6 +3365,20 @@
       column_key: context.column_key || columnKeyFromPath(columnPath),
       cell_value: context.cell_value ?? context.clicked_value ?? null
     };
+    const fieldKey = enriched.column_key || enriched.column_label || enriched.column_id || "cell_value";
+    enriched.cell_value = sanitizeGridValue(enriched.cell_value, fieldKey, context.cell || null);
+    if (Object.prototype.hasOwnProperty.call(enriched, "clicked_value")) {
+      enriched.clicked_value = sanitizeGridValue(enriched.clicked_value, fieldKey, context.cell || null);
+    }
+    enriched.row_context_map = sanitizeGridRowData(enriched.row_context_map);
+    enriched.row_context = sanitizeGridRowContext(enriched.row_context, enriched.row_candidate_pairs);
+    if (Array.isArray(enriched.row_candidate_pairs)) {
+      enriched.row_candidate_pairs = enriched.row_candidate_pairs.map((pair) => ({
+        ...pair,
+        value: sanitizeGridValue(pair?.value, pair?.key || "row_value")
+      }));
+    }
+    return enriched;
   }
 
   function gridRowDataFromContext(context) {
@@ -3229,7 +3393,7 @@
       context.row_context_map ||
       null;
     return value && typeof value === "object" && !Array.isArray(value)
-      ? limitObjectEntries(value, MAX_GRID_ROW_FIELDS)
+      ? sanitizeGridRowData(value)
       : value;
   }
 
@@ -3264,7 +3428,11 @@
       const modelColIndex = context.model_col_index ?? null;
     const columnLabel = context.column_label || null;
     const columnKey = context.column_key || context.column_id || columnLabel || null;
-    const cellValue = context.cell_value ?? null;
+    const cellValue = sanitizeGridValue(
+      context.cell_value ?? null,
+      columnKey || columnLabel || "cell_value",
+      context.cell || null
+    );
     return {
       kind: options.kind || "grid_cell_click",
       source: options.source || context.source || context.parser || null,
@@ -3691,7 +3859,8 @@
       row_index: inputContextSource?.row_index ?? null,
       col_index: inputContextSource?.col_index ?? null,
       column_key: inputContextSource?.column_key ?? null,
-      editor_id: inputContextSource?.editor_id ?? null
+      editor_id: inputContextSource?.editor_id ?? null,
+      associated_label: inputContextSource?.associated_label ?? associatedLabelOf(element)?.text ?? null
     };
   }
 
@@ -3753,9 +3922,9 @@
     const signatures = new Set();
     for (const candidate of uiOutcomeCandidates()) {
       if (!(candidate instanceof Element) || !isVisibleCandidate(candidate)) continue;
-      const message = extractUiOutcomeText(candidate);
-      if (!message) continue;
-      signatures.add(uiOutcomeSignature(candidate, classifyUiOutcomeKind(candidate), message));
+      const resolved = resolveUiOutcomeCandidate(candidate);
+      if (!resolved) continue;
+      signatures.add(uiOutcomeSignature(candidate, resolved.kind, resolved.message));
     }
     return signatures;
   }
@@ -3763,6 +3932,82 @@
   function visibleTextOf(el) {
     if (!(el instanceof Element)) return null;
     return String(el.innerText || el.textContent || "").replace(/\s+/g, " ").trim() || null;
+  }
+
+  function compactSemanticText(value, maxLength = MAX_SEMANTIC_TEXT_CHARS) {
+    const text = String(value || "").replace(/\s+/g, " ").trim();
+    if (!text) return null;
+    return text.length > maxLength ? text.slice(0, maxLength).trim() : text;
+  }
+
+  function ariaLabelledByText(el) {
+    if (!(el instanceof Element)) return null;
+    const values = `${el.getAttribute("aria-labelledby") || ""}`
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((id) => compactSemanticText(visibleTextOf(document.getElementById(id)) || textOf(document.getElementById(id))))
+      .filter(Boolean);
+    return compactSemanticText(values.join(" "));
+  }
+
+  function labelTextWithoutControls(label) {
+    if (!(label instanceof Element)) return null;
+    const clone = label.cloneNode(true);
+    clone.querySelectorAll?.("input,select,textarea,button,[role='button']").forEach((node) => node.remove());
+    return compactSemanticText(clone.textContent);
+  }
+
+  function associatedLabelOf(el) {
+    if (!(el instanceof Element)) return null;
+    const labelledBy = ariaLabelledByText(el);
+    if (labelledBy) return { text: labelledBy, source: "aria-labelledby", confidence: 1 };
+
+    const ariaLabel = compactSemanticText(el.getAttribute("aria-label"));
+    if (ariaLabel) return { text: ariaLabel, source: "aria-label", confidence: 0.98 };
+
+    if (el.id) {
+      try {
+        const explicit = document.querySelector(`label[for="${CSS.escape(el.id)}"]`);
+        const text = labelTextWithoutControls(explicit);
+        if (text) return { text, source: "label-for", confidence: 1 };
+      } catch {}
+    }
+
+    const wrapping = labelTextWithoutControls(el.closest?.("label"));
+    if (wrapping) return { text: wrapping, source: "wrapping-label", confidence: 0.95 };
+
+    for (const [source, value] of [
+      ["placeholder", el.getAttribute("placeholder")],
+      ["title", el.getAttribute("title")]
+    ]) {
+      const text = compactSemanticText(value);
+      if (text) return { text, source, confidence: 0.7 };
+    }
+    return null;
+  }
+
+  function semanticTextContextOf(el, action, rawText) {
+    const raw = String(rawText || "").replace(/\s+/g, " ").trim();
+    const label = associatedLabelOf(el);
+    const broadContainer = Boolean(
+      el?.matches?.("dialog,[role='dialog'],[role='alertdialog'],[role='grid'],[role='treegrid'],table,tbody,thead,ul,ol,main,section,article,form,.modal,.cl-popup,.cl-dialog,.cl-window") ||
+      looksLikeBroadClickContainer(el)
+    );
+    const heading = broadContainer ? compactSemanticText(primaryContainerHeadingLabel(el)) : null;
+    const direct = compactSemanticText(directTextOf(el));
+    const outcomeMessage = action === "ui_outcome" ? compactSemanticText(raw) : null;
+    const popupTitle = /popup_(?:open|close)/.test(String(action || "")) ? popupTitleOf(el) : null;
+    const candidate = popupTitle || outcomeMessage || label?.text || heading || direct || (!broadContainer ? compactSemanticText(raw) : null);
+    const source = popupTitle ? "popup-title" : outcomeMessage ? "ui-outcome-message" : label?.text ? label.source : heading ? "container-heading" : direct ? "direct-text" : candidate ? "visible-text" : "excluded-container-text";
+    return {
+      version: TEXT_CONTEXT_VERSION,
+      semantic_text: candidate,
+      source,
+      confidence: popupTitle || outcomeMessage ? 0.98 : label?.confidence ?? (heading ? 0.9 : direct ? 0.85 : candidate ? 0.55 : 0),
+      original_length: raw.length,
+      descendant_text_excluded: broadContainer && raw.length > String(candidate || "").length,
+      truncated: Boolean(candidate && candidate.length >= MAX_SEMANTIC_TEXT_CHARS && raw.length > candidate.length)
+    };
   }
 
   function directTextOf(el) {
@@ -4042,7 +4287,8 @@
         cells: []
       };
 
-      const value = visibleTextOf(cell) || textOf(cell);
+      const columnLabel = headers[meta.colIndex - 1] || `col_${meta.colIndex}`;
+      const value = sanitizeGridValue(visibleTextOf(cell) || textOf(cell), columnLabel, cell);
       if (!value) {
         rowMap.set(meta.rowIndex, rowEntry);
         continue;
@@ -4055,7 +4301,7 @@
       }
 
       rowEntry.cells.push({
-        label: headers[meta.colIndex - 1] || `col_${meta.colIndex}`,
+        label: columnLabel,
         value,
         selector: cssPath(cell),
         row_index: meta.rowIndex,
@@ -4376,8 +4622,20 @@
   }
 
   function parseGenericCellIndex(el) {
-    const rowAttr = readNumericAttr(el, ["data-row-index", "data-rowindex", "aria-rowindex", "data-row"]);
-    const colAttr = readNumericAttr(el, ["data-col-index", "data-colindex", "aria-colindex", "data-col"]);
+    const rowAttr =
+      readNumericAttr(el, ["data-row-index", "data-rowindex", "aria-rowindex", "data-row"]) ??
+      readNumericAttr(el.parentElement, ["data-row-index", "data-rowindex", "aria-rowindex", "data-row"]);
+    let colAttr = readNumericAttr(el, ["data-col-index", "data-colindex", "aria-colindex", "data-col"]);
+    if (colAttr == null && el.parentElement) {
+      const role = el.getAttribute("role");
+      if (["columnheader", "rowheader", "gridcell", "cell"].includes(role)) {
+        const siblings = [...el.parentElement.children].filter((candidate) =>
+          ["columnheader", "rowheader", "gridcell", "cell"].includes(candidate.getAttribute?.("role"))
+        );
+        const siblingIndex = siblings.indexOf(el);
+        if (siblingIndex >= 0) colAttr = siblingIndex + 1;
+      }
+    }
     if (rowAttr != null || colAttr != null) {
       return { rowIndex: rowAttr, colIndex: colAttr };
     }
@@ -4554,9 +4812,12 @@
     const bodyCandidates = cells.filter((cell) => !cell.isColumnHeader);
     if (bodyCandidates.length === 0) return null;
 
-    const firstBodyRow = Math.min(...bodyCandidates.map((cell) => cell.visualRowIndex));
+    const firstBodyCell = [...bodyCandidates].sort((a, b) =>
+      (a.rowIndex ?? a.visualRowIndex) - (b.rowIndex ?? b.visualRowIndex) ||
+      (a.colIndex ?? a.visualColIndex) - (b.colIndex ?? b.visualColIndex)
+    )[0];
     const firstBodyCells = cells
-      .filter((cell) => cell.visualRowIndex === firstBodyRow && !cell.isRowHeader)
+      .filter((cell) => sameGenericGridRow(cell, firstBodyCell) && !cell.isColumnHeader && !cell.isRowHeader)
       .sort((a, b) => a.rect.left - b.rect.left);
 
     for (const cell of firstBodyCells) {
@@ -4592,16 +4853,53 @@
     return overlap / Math.max(1, Math.min(a.width, b.width));
   }
 
+  function genericGridRowGroup(cell) {
+    if (!cell) return null;
+    if (cell.rowIndex != null) return `row:${cell.rowIndex}`;
+    return cell.element?.closest?.("[role='row']") || `visual:${cell.visualRowIndex}`;
+  }
+
+  function sameGenericGridRow(left, right) {
+    if (!left || !right) return false;
+    return genericGridRowGroup(left) === genericGridRowGroup(right);
+  }
+
+  function genericGridColumnOrder(cell) {
+    return cell?.colIndex ?? cell?.visualColIndex ?? null;
+  }
+
+  function genericGridCellIsBefore(candidate, cell) {
+    const candidateIndex = genericGridColumnOrder(candidate);
+    const cellIndex = genericGridColumnOrder(cell);
+    if (candidateIndex != null && cellIndex != null) return candidateIndex < cellIndex;
+    return candidate.rect.right <= cell.rect.left + 1;
+  }
+
   function genericGridColumnPathForCell(model, cell) {
-    const headerParts = model.cells
-      .filter((header) =>
-        header !== cell &&
-        header.isColumnHeader &&
-        header.rect.bottom <= cell.rect.top + 1 &&
-        horizontalOverlapRatio(header.rect, cell.rect) >= 0.35
-      )
-      .sort((a, b) => a.rect.top - b.rect.top || a.rect.left - b.rect.left)
-      .map((header) => header.value);
+    const headerGroups = new Map();
+    for (const header of model.cells.filter((candidate) => candidate !== cell && candidate.isColumnHeader)) {
+      const groupKey = header.element?.closest?.("[role='row']") || header.element?.parentElement || `visual:${header.visualRowIndex}`;
+      const group = headerGroups.get(groupKey) || [];
+      group.push(header);
+      headerGroups.set(groupKey, group);
+    }
+
+    const cellColIndex = genericGridColumnOrder(cell);
+    const headerParts = [...headerGroups.values()]
+      .map((headers) => headers
+        .map((header) => {
+          const headerColIndex = genericGridColumnOrder(header);
+          const exactIndex = cellColIndex != null && headerColIndex != null && Number(cellColIndex) === Number(headerColIndex);
+          const sameVisualColumn = header.visualColIndex === cell.visualColIndex;
+          const overlap = horizontalOverlapRatio(header.rect, cell.rect);
+          const score = exactIndex ? 100 : sameVisualColumn ? 60 : Math.round(overlap * 40);
+          return { header, score, overlap };
+        })
+        .filter((candidate) => candidate.score >= 14)
+        .sort((a, b) => b.score - a.score || b.overlap - a.overlap)[0] || null)
+      .filter(Boolean)
+      .sort((a, b) => a.header.rect.top - b.header.rect.top)
+      .map((candidate) => candidate.header.value);
 
     if (headerParts.length > 0) return dedupeOrderedParts(headerParts);
 
@@ -4621,8 +4919,8 @@
     const semanticCandidates = model.cells
       .filter((candidate) =>
         candidate !== cell &&
-        candidate.visualRowIndex === cell.visualRowIndex &&
-        candidate.rect.right <= cell.rect.left + 1 &&
+        sameGenericGridRow(candidate, cell) &&
+        genericGridCellIsBefore(candidate, cell) &&
         (!candidate.isColumnHeader || candidate.isRowHeader) &&
         (candidate.isRowHeader || !looksNumericLikeText(candidate.value))
       )
@@ -4636,9 +4934,8 @@
     return dedupeOrderedParts(model.cells
       .filter((candidate) =>
         candidate !== cell &&
-        candidate.visualRowIndex === cell.visualRowIndex &&
-        candidate.rect.right <= cell.rect.left + 1 &&
-        candidate.visualColIndex < cell.visualColIndex &&
+        sameGenericGridRow(candidate, cell) &&
+        genericGridCellIsBefore(candidate, cell) &&
         (!candidate.isColumnHeader || candidate.isRowHeader)
       )
       .sort((a, b) => a.rect.left - b.rect.left)
@@ -4647,17 +4944,13 @@
   }
 
   function buildGenericGridRows(model) {
-    const headerRows = model.cells
-      .filter((cell) => cell.isColumnHeader)
-      .map((cell) => cell.visualRowIndex);
-    const lastHeaderRow = headerRows.length > 0 ? Math.max(...headerRows) : -1;
     const rowMap = new Map();
 
     for (const cell of model.cells) {
-      if (cell.visualRowIndex <= lastHeaderRow && cell.isColumnHeader) continue;
-      if (cell.isRowHeader) continue;
+      if (cell.isColumnHeader || cell.isRowHeader) continue;
 
-      const row = rowMap.get(cell.visualRowIndex) || {
+      const rowKey = genericGridRowGroup(cell);
+      const row = rowMap.get(rowKey) || {
         row_index: cell.rowIndex ?? cell.visualRowIndex,
         row_path: genericGridRowPathForCell(model, cell),
         cells: []
@@ -4671,7 +4964,7 @@
         col_index: cell.colIndex ?? cell.visualColIndex,
         col_path: colPath
       });
-      rowMap.set(cell.visualRowIndex, row);
+      rowMap.set(rowKey, row);
     }
 
     return [...rowMap.values()]
@@ -4724,7 +5017,7 @@
         row_count: grid.row_count,
         col_count: grid.col_count,
         column_paths: grid.column_paths,
-        rows: grid.rows
+        rows: grid.rows.map((row) => sanitizeStructuredGridRow(row))
       }));
   }
 
@@ -4791,9 +5084,8 @@
       const rowCells = best.model.cells
         .filter((candidate) =>
           candidate !== best.cell &&
-          candidate.visualRowIndex === best.cell.visualRowIndex &&
-          candidate.rect.right <= best.cell.rect.left + 1 &&
-          candidate.visualColIndex < best.cell.visualColIndex &&
+          sameGenericGridRow(candidate, best.cell) &&
+          genericGridCellIsBefore(candidate, best.cell) &&
           (!candidate.isColumnHeader || candidate.isRowHeader)
         )
         .sort((a, b) => a.rect.left - b.rect.left);
@@ -4879,10 +5171,11 @@
 
       return [...row.querySelectorAll("td, th")].map((cell) => {
         const colSpan = Number(cell.getAttribute("colspan") || 1);
-        const value = visibleTextOf(cell) || textOf(cell);
         const colPath = headerPaths[colCursor] || [];
+        const columnLabel = colPath.join(" > ") || `col_${colCursor + 1}`;
+        const value = sanitizeGridValue(visibleTextOf(cell) || textOf(cell), columnLabel, cell);
         const entry = value ? {
-          label: colPath.join(" > ") || `col_${colCursor + 1}`,
+          label: columnLabel,
           value,
           selector: cssPath(cell),
           row_index: rowIndex,
@@ -5520,7 +5813,7 @@
     activeCprDomMenuPath = prefix;
     activeCprDomMenuPath[level - 1] = label;
     activeCprDomMenuPath.length = level;
-    const path = activeCprDomMenuPath.filter(Boolean);
+    const path = [...activeCprTopMenuPath, ...activeCprDomMenuPath.filter(Boolean)];
 
     return {
       item,
@@ -5531,15 +5824,42 @@
       parser: "cpr_level_dom",
       score: parentComplete ? 12 : 8,
       confidence: parentComplete ? 0.99 : 0.68,
-      depth: level,
+      depth: path.length,
       captureStatus: parentComplete ? "complete" : "partial",
       confidenceReasons: ["cpr_level_class", "click_sequence"],
       warnings: parentComplete ? [] : ["cpr_parent_path_missing"]
     };
   }
 
+  function resolveCprTopNavigationPath(target) {
+    if (location.origin !== "http://211.109.22.33:8791" || !(target instanceof Element)) return null;
+    const item = target.closest(".cl-navigationbar-item[role='menuitem']");
+    if (!(item instanceof Element)) return null;
+    const labelNode = target.closest(".cl-navigationbar-text,.cl-text") || item.querySelector(".cl-navigationbar-text,.cl-text");
+    const label = cleanMenuLabel(visibleTextOf(labelNode) || extractMenuItemLabel(item));
+    if (!shouldUseMenuLabel(label)) return null;
+    activeCprTopMenuPath = [label];
+    activeCprDomMenuPath = [];
+    return {
+      item,
+      source: "tree",
+      label,
+      path: [...activeCprTopMenuPath],
+      pathText: label,
+      parser: "cpr_navigationbar_dom",
+      score: 12,
+      confidence: 0.99,
+      depth: 1,
+      captureStatus: "complete",
+      confidenceReasons: ["cpr_navigationbar_item", "click_sequence"],
+      warnings: []
+    };
+  }
+
   function resolveTreePath(target) {
     if (!(target instanceof Element)) return null;
+    const cprTopItem = resolveCprTopNavigationPath(target);
+    if (cprTopItem) return cprTopItem;
     const cprItem = resolveCprLevelMenuPath(target);
     if (cprItem) return cprItem;
     const ariaItem = target.closest('[role="treeitem"]');
@@ -5628,7 +5948,7 @@
       const rows = [...grid.querySelectorAll('[role="row"]')].slice(1, 10).map((row) => {
         return [...row.querySelectorAll('[role="gridcell"], [role="cell"]')].map((cell, index) => ({
           label: headers[index] || `col_${index + 1}`,
-          value: visibleTextOf(cell) || textOf(cell),
+          value: sanitizeGridValue(visibleTextOf(cell) || textOf(cell), headers[index] || `col_${index + 1}`, cell),
           row_index: cell.getAttribute("data-row-index") || null,
           col_id: cell.getAttribute("data-col-id") || null,
           selector: cssPath(cell)
@@ -6007,7 +6327,7 @@
       const colId = cell.getAttribute("data-col-id");
       if (!rowIndex || !colId) continue;
       const row = rowMap.get(rowIndex) || [];
-      const value = visibleTextOf(cell) || textOf(cell);
+      const value = sanitizeGridValue(visibleTextOf(cell) || textOf(cell), colId, cell);
       if (value) {
         row.push({
           label: colId,
@@ -6053,7 +6373,11 @@
               .map((cell, colIndex) => ({
                 col_index: Number(cell.getAttribute("aria-colindex")) || colIndex,
                 column_label: headers[colIndex]?.label || null,
-                value: sanitizeStructuredValue(visibleTextOf(cell) || textOf(cell), { key: "cell_value", element: cell }),
+                value: sanitizeGridValue(
+                  visibleTextOf(cell) || textOf(cell),
+                  headers[colIndex]?.label || `col_${colIndex + 1}`,
+                  cell
+                ),
                 selector: cssPath(cell)
               }))
           }));
@@ -6762,16 +7086,37 @@
     const rawElementText = hasElementTextOverride
       ? extra.elementText
       : (el && !isDocumentLevelElement(el) ? visibleTextOf(el) : null);
-    const elementText = sanitizeStructuredValue(rawElementText, {
-      key: "element_text",
+    const textContext = semanticTextContextOf(el, action, rawElementText);
+    const associatedLabelContext = associatedLabelOf(el);
+    const associatedLabel = compactSemanticText(
+      extra?.gridContext?.column_label ||
+      extra?.gridContext?.column_key ||
+      associatedLabelContext?.text
+    );
+    const elementText = sanitizeStructuredValue(textContext.semantic_text, {
+      key: extra?.gridContext?.column_key || extra?.gridContext?.column_label || "element_text",
       element: el || null
     });
+    const sanitizedTextContext = {
+      ...textContext,
+      semantic_text: elementText
+    };
     const bounds = el ? boundsOf(el) : null;
     const correlationId = extra?.correlationId || null;
     const payloadSource =
       extra?.payload && typeof extra.payload === "object" && !Array.isArray(extra.payload)
         ? { ...extra.payload }
         : {};
+    const gridFieldKey = extra?.gridContext?.column_key || extra?.gridContext?.column_label || extra?.gridContext?.column_id || null;
+    if (gridFieldKey && Object.prototype.hasOwnProperty.call(payloadSource, "clicked_value")) {
+      payloadSource.clicked_value = sanitizeGridValue(payloadSource.clicked_value, gridFieldKey, el || null);
+    }
+    if (gridFieldKey && Array.isArray(payloadSource.clicked_row_path)) {
+      payloadSource.clicked_row_path = sanitizeGridRowPath(payloadSource.clicked_row_path, extra?.gridContext || null);
+      if (Object.prototype.hasOwnProperty.call(payloadSource, "clicked_row_label")) {
+        payloadSource.clicked_row_label = payloadSource.clicked_row_path.join(" > ") || null;
+      }
+    }
     if (extra?.relatedInteractionId) {
       payloadSource.related_interaction_id = extra.relatedInteractionId;
     }
@@ -6856,9 +7201,12 @@
       element_text: elementText,
       bounds,
       correlation_id: correlationId,
-      snapshot: extra?.snapshot || null,
+      snapshot: gridFieldKey
+        ? sanitizeGridSnapshotValues(extra?.snapshot || null, gridFieldKey, el || null, extra?.gridContext || null)
+        : extra?.snapshot || null,
       payload: {
         ...payloadFields,
+        context_schema_version: CONTEXT_SCHEMA_VERSION,
         ...(shouldAttachMenuContext ? { menu_context: menuContext ?? null } : {}),
         ...(gridContext ? { grid_context: gridContext } : {}),
         ...(gridInteractionPayload ? {
@@ -6875,6 +7223,7 @@
         ...(inputContext ? { input_context: inputContext } : {}),
         ...(apiContext ? { api_context: apiContext } : {}),
         ...(uiOutcomeContext ? { ui_outcome: uiOutcomeContext } : {}),
+        text_context: sanitizedTextContext,
         ...(sanitizedPopupContext || hasPopupContextOverride || Object.prototype.hasOwnProperty.call(payloadFields || {}, "popup_context")
           ? { popup_context: sanitizedPopupContext }
           : {}),
@@ -6896,7 +7245,8 @@
           extension_build: EXTENSION_BUILD,
           sdk_version: payloadFields.sdk_version || null,
           sdk_build: payloadFields.sdk_build || null,
-          collector_build: COLLECTOR_BUILD
+          collector_build: COLLECTOR_BUILD,
+          context_schema_version: CONTEXT_SCHEMA_VERSION
         },
         page_context: {
           page_session_id: pageSessionId,
@@ -6917,6 +7267,7 @@
           selector_xpath: selectorXpath,
           element_tag: elementTag,
           element_text: elementText,
+          associated_label: associatedLabel,
           bounds,
           popup_context: sanitizedPopupContext
         },
@@ -7126,41 +7477,98 @@
   }
 
   function uiOutcomeCandidates() {
-    return [...document.querySelectorAll([
-      "[role='alert']",
-      "[role='status']",
-      "[aria-live]",
-      ".toast",
-      ".alert",
-      "dialog[open]",
-      "[aria-modal='true']",
-      ".modal",
-      ".invalid-feedback",
-      ".validation-message",
-      ".error-message",
-      "[data-validation-message]",
-      "[aria-invalid='true']"
-    ].join(","))];
+    return [
+      ...document.querySelectorAll(UI_OUTCOME_SELECTOR),
+      ...visiblePopupRoots()
+    ];
   }
 
   function extractUiOutcomeText(el) {
     if (!(el instanceof Element)) return null;
-    const direct = visibleTextOf(el) || textOf(el);
-    if (direct) return direct;
-
     if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement || el instanceof HTMLSelectElement) {
-      if (el.validationMessage) return el.validationMessage;
+      if (el.validationMessage) return compactSemanticText(el.validationMessage);
       const describedBy = `${el.getAttribute("aria-describedby") || ""} ${el.getAttribute("aria-errormessage") || ""}`
         .split(/\s+/)
         .filter(Boolean);
       for (const id of describedBy) {
         const node = document.getElementById(id);
         const message = visibleTextOf(node) || textOf(node);
-        if (message) return message;
+        if (message) return compactSemanticText(message);
       }
     }
 
-    return null;
+    return compactSemanticText(directTextOf(el) || visibleTextOf(el) || textOf(el));
+  }
+
+  function popupMessageText(el) {
+    if (!(el instanceof Element)) return { message: null, source: null };
+    const describedBy = `${el.getAttribute("aria-describedby") || ""}`
+      .split(/\s+/)
+      .filter(Boolean)
+      .map((id) => compactSemanticText(visibleTextOf(document.getElementById(id)) || textOf(document.getElementById(id))))
+      .filter(Boolean);
+    if (describedBy.length) {
+      return { message: compactSemanticText(describedBy.join(" ")), source: "aria-describedby" };
+    }
+
+    const clone = el.cloneNode(true);
+    clone.querySelectorAll?.([
+      "button", "input", "select", "textarea", "option", "[contenteditable='true']",
+      "h1", "h2", "h3", "h4", "h5", "h6", "[role='heading']",
+      "script", "style"
+    ].join(",")).forEach((node) => node.remove());
+    return { message: compactSemanticText(clone.textContent), source: "static-dialog-text" };
+  }
+
+  function popupMessageEvidence(el) {
+    if (!(el instanceof Element) || !isPopupRoot(el)) return null;
+    if (el.querySelector(UI_OUTCOME_SELECTOR)) {
+      return { status: "explicit_descendant", message: null, source: "explicit-outcome-descendant", confidence: 1 };
+    }
+
+    const hasStructuredContent = Boolean(el.querySelector([
+      "input", "select", "textarea", "[contenteditable='true']", "form", "table",
+      "[role='grid']", "[role='treegrid']", "[role='tree']", "[role='listbox']"
+    ].join(",")));
+    if (hasStructuredContent) {
+      return { status: "excluded_structured_popup", message: null, source: "popup-structure", confidence: 0 };
+    }
+
+    const { message, source } = popupMessageText(el);
+    if (!message) return { status: "no_message", message: null, source, confidence: 0 };
+    const role = String(el.getAttribute("role") || "").toLowerCase();
+    const hasOutcomeSignal = /(?:success|succeed|complete|completed|saved|approved|rejected|failed|failure|error|invalid|cancelled|canceled|성공|완료|저장|승인|반려|실패|오류|유효하지|취소)/i.test(message);
+    if (role === "alertdialog") {
+      return { status: "resolved", message, source, confidence: 0.98, evidence: ["alertdialog-role"] };
+    }
+    if (hasOutcomeSignal) {
+      return { status: "resolved", message, source, confidence: 0.9, evidence: ["static-popup", "outcome-language"] };
+    }
+    return { status: "ambiguous", message, source, confidence: 0.45, evidence: ["static-popup"] };
+  }
+
+  function resolveUiOutcomeCandidate(el) {
+    if (!(el instanceof Element)) return null;
+    if (el.matches?.(UI_OUTCOME_SELECTOR)) {
+      const message = extractUiOutcomeText(el);
+      if (!message) return null;
+      return {
+        kind: classifyUiOutcomeKind(el),
+        message,
+        confidence: 1,
+        messageSource: "explicit-outcome-element",
+        evidence: [el.getAttribute("role") || el.tagName.toLowerCase()]
+      };
+    }
+    const popupEvidence = popupMessageEvidence(el);
+    if (!popupEvidence || popupEvidence.status !== "resolved" || !popupEvidence.message) return null;
+    return {
+      kind: "modal_message",
+      message: popupEvidence.message,
+      confidence: popupEvidence.confidence,
+      messageSource: popupEvidence.source,
+      evidence: popupEvidence.evidence || []
+    };
   }
 
   function isVisibleCandidate(el) {
@@ -7212,7 +7620,12 @@
     const headingText = visibleTextOf(heading) || textOf(heading);
     if (headingText) return headingText.slice(0, 160);
 
-    const fallback = visibleTextOf(el) || textOf(el);
+    const fallback = compactSemanticText(
+      el.getAttribute("data-title") ||
+      el.getAttribute("name") ||
+      el.id ||
+      el.getAttribute("role")
+    );
     return fallback ? fallback.slice(0, 160) : null;
   }
 
@@ -7419,6 +7832,7 @@
       opener_event_id: state.openedByEventId,
       closer_interaction_id: closeAction?.interactionId || null,
       closer_event_id: closeAction?.eventId || null,
+      message_candidate: el instanceof Element ? popupMessageEvidence(el) : null,
       stack
     };
     const row = buildRow(el instanceof Element ? el : document.documentElement, action, {
@@ -7542,6 +7956,9 @@
       kind: "ui_outcome",
       outcome_kind: outcomeKind,
       outcome_message: message,
+      outcome_confidence: options.resolved?.confidence ?? null,
+      outcome_message_source: options.resolved?.messageSource || null,
+      outcome_evidence: options.resolved?.evidence || [],
       source_action: state.sourceAction,
       source_interaction_id: state.interactionId,
       source_event_id: state.sourceEventId,
@@ -7566,24 +7983,26 @@
     if (!state || activeOutcomeObserver !== state) return;
     for (const candidate of uiOutcomeCandidates()) {
       if (!(candidate instanceof Element) || !isVisibleCandidate(candidate)) continue;
-      const message = extractUiOutcomeText(candidate);
-      if (!message) continue;
-      emitUiOutcomeRow(state, candidate, classifyUiOutcomeKind(candidate), message);
+      const resolved = resolveUiOutcomeCandidate(candidate);
+      if (!resolved) continue;
+      emitUiOutcomeRow(state, candidate, resolved.kind, resolved.message, { resolved });
     }
   }
 
   function scanUiOutcomesFromRoot(state, root) {
     if (!state || activeOutcomeObserver !== state || !(root instanceof Element)) return;
     const candidates = [];
-    if (root.matches?.("[role='alert'], [role='status'], [aria-live], .toast, .alert, dialog[open], [aria-modal='true'], .modal, .invalid-feedback, .validation-message, .error-message, [data-validation-message], [aria-invalid='true']")) {
+    if (root.matches?.(UI_OUTCOME_SELECTOR)) {
       candidates.push(root);
     }
-    candidates.push(...root.querySelectorAll?.("[role='alert'], [role='status'], [aria-live], .toast, .alert, dialog[open], [aria-modal='true'], .modal, .invalid-feedback, .validation-message, .error-message, [data-validation-message], [aria-invalid='true']") || []);
+    candidates.push(...root.querySelectorAll?.(UI_OUTCOME_SELECTOR) || []);
+    if (isPopupRoot(root)) candidates.push(root);
+    candidates.push(...[...root.querySelectorAll?.(POPUP_ROOT_SELECTOR) || []].filter(isPopupRoot));
     for (const candidate of candidates) {
       if (!(candidate instanceof Element) || !isVisibleCandidate(candidate)) continue;
-      const message = extractUiOutcomeText(candidate);
-      if (!message) continue;
-      emitUiOutcomeRow(state, candidate, classifyUiOutcomeKind(candidate), message, { fromAddedNode: true });
+      const resolved = resolveUiOutcomeCandidate(candidate);
+      if (!resolved) continue;
+      emitUiOutcomeRow(state, candidate, resolved.kind, resolved.message, { fromAddedNode: true, resolved });
     }
   }
 

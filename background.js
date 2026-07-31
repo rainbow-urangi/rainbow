@@ -14,6 +14,26 @@ const DEFAULT_RUNTIME_CONFIG_TTL_MS = 5 * 60 * 1000;
 const QUEUE_FLUSH_ALARM_NAME = "AZ_TEST_QUEUE_FLUSH_WAKE";
 const QUEUE_FLUSH_ALARM_PERIOD_MINUTES = 1;
 const DEBUG_LOG_ALL_UPLOAD_PAYLOADS = false;
+const DEBUG_LOG_QUEUE_CONTENTS = true;
+const QUEUE_LOG_COLUMNS = [
+  "event_sequence",
+  "action",
+  "event_id",
+  "event_time",
+  "page_session_id",
+  "interaction_id",
+  "related_interaction_id",
+  "element_text",
+  "api_path",
+  "api_status",
+  "menu_path",
+  "grid_id",
+  "grid_row",
+  "grid_column",
+  "popup_title",
+  "identity_held",
+  "queue_size"
+];
 const DEFAULT_API_CAPTURE_CONFIG = Object.freeze({
   enabled: true,
   transaction_mode: true,
@@ -679,6 +699,8 @@ function normalizeRowForCollector(row, ingestUrl) {
     payload.grid_cell_click && typeof payload.grid_cell_click === "object" ? payload.grid_cell_click : null;
   const popupContext =
     payload.popup_context && typeof payload.popup_context === "object" ? payload.popup_context : null;
+  const textContext =
+    payload.text_context && typeof payload.text_context === "object" ? payload.text_context : null;
 
   const action = typeof row.action === "string" && row.action.trim() ? row.action.trim() : "change";
   const rawEventTime =
@@ -743,6 +765,7 @@ function normalizeRowForCollector(row, ingestUrl) {
       grid_context: toJsonSafeObject(gridContext),
       grid_cell_click: toJsonSafeObject(gridCellClick),
       popup_context: toJsonSafeObject(popupContext),
+      text_context: toJsonSafeObject(textContext),
       ui_outcome: toJsonSafeObject(uiOutcome),
       analysis: {
         event_sequence: row.event_sequence ?? null,
@@ -757,6 +780,7 @@ function normalizeRowForCollector(row, ingestUrl) {
         runtime_config_schema_version: row.runtime_config_schema_version ?? payload?.runtime_context?.schema_version ?? null,
         runtime_rule_ids: row.runtime_rule_ids ?? payload?.runtime_context?.matched_rule_ids ?? null,
         runtime_modules: row.runtime_modules ?? payload?.runtime_context?.active_module_names ?? null,
+        context_schema_version: payload.context_schema_version ?? textContext?.version ?? null,
         bounds: row.bounds ?? null
       },
       raw_payload: toJsonSafeObject(payload)
@@ -822,6 +846,73 @@ function attachIdentityContext(row, sourceRow) {
       identity_context: identity
     }
   };
+}
+
+function truncateQueueLogValue(value, maxLength = 120) {
+  const text = String(value ?? "").replace(/\s+/g, " ").trim();
+  if (!text) return null;
+  return text.length > maxLength ? `${text.slice(0, maxLength)}...` : text;
+}
+
+function queueRowPreview(row) {
+  const payload = row?.payload && typeof row.payload === "object" ? row.payload : {};
+  const eventContext = payload.event_context || {};
+  const relationContext = payload.relation_context || {};
+  const pageContext = payload.page_context || {};
+  const apiContext = payload.api_context || {};
+  const menuContext = payload.menu_context || {};
+  const gridContext = payload.grid_context || payload.grid_cell_click || {};
+  const popupContext = payload.popup_context || {};
+  const activePopup = popupContext.target_popup || popupContext.stack?.at?.(-1) || {};
+
+  return {
+    event_sequence: row?.event_sequence ?? eventContext.event_sequence ?? null,
+    action: row?.action || eventContext.action || payload.kind || null,
+    event_id: row?.event_id || eventContext.event_id || null,
+    event_time: row?.event_time || eventContext.event_time || null,
+    page_session_id: row?.page_session_id || pageContext.page_session_id || null,
+    interaction_id: row?.interaction_id || eventContext.interaction_id || null,
+    related_interaction_id:
+      row?.related_interaction_id ||
+      relationContext.related_interaction_id ||
+      eventContext.related_interaction_id ||
+      null,
+    element_text: truncateQueueLogValue(row?.element_text),
+    api_path: apiContext.url_path || row?.AZ_api_url || null,
+    api_status: apiContext.status ?? row?.AZ_api_status ?? null,
+    menu_path: menuContext.path_text || menuContext.selected_path_text || null,
+    grid_id: gridContext.grid_id || null,
+    grid_row: gridContext.row_index ?? null,
+    grid_column: gridContext.column_key || gridContext.column_id || gridContext.column_label || null,
+    popup_title:
+      popupContext.active_popup_title ||
+      activePopup.title ||
+      null,
+    identity_held: rowIsIdentityHeld(row)
+  };
+}
+
+function debugLogQueuedEvents(rows) {
+  if (!DEBUG_LOG_QUEUE_CONTENTS) return;
+  try {
+    const queuedRows = Array.isArray(rows) ? rows : [];
+    for (const row of queuedRows) {
+      const event = {
+        ...queueRowPreview(row),
+        queue_size: pendingRows.length
+      };
+      console.group(
+        `[Rainbow Collector] 큐 적재 이벤트 · seq=${event.event_sequence ?? "-"} · action=${event.action || "-"}`
+      );
+      console.table([event], QUEUE_LOG_COLUMNS);
+      console.groupEnd();
+    }
+  } catch (error) {
+    console.warn("[Rainbow Collector] 큐 적재 이벤트 로그 생성 실패", {
+      "실패 이유": error?.message || String(error),
+      "현재 대기 row 수": pendingRows.length
+    });
+  }
 }
 
 function normalizeRowsForUpload(rows, ingestUrl, networkContext, collectorContext = {}) {
@@ -1050,6 +1141,7 @@ async function enqueueRows(rows, sender = {}) {
   }
   truncateQueueToMax();
   await persistQueue();
+  debugLogQueuedEvents(preparedRows);
   scheduleUpload(
     shouldFlushImmediately ? 0 : BASE_UPLOAD_DELAY_MS,
     shouldFlushImmediately
