@@ -1860,10 +1860,20 @@ function installMainWorldBridge(bridgeNonce) {
   };
 
   const collectCprGridContextNow = (detail = {}) => {
-    const point = detail.point && Number.isFinite(Number(detail.point.x)) && Number.isFinite(Number(detail.point.y))
+    const rawPoint = detail.point && Number.isFinite(Number(detail.point.x)) && Number.isFinite(Number(detail.point.y))
       ? { x: Number(detail.point.x), y: Number(detail.point.y) }
       : null;
     const targetHint = detail.targetHint && typeof detail.targetHint === "object" ? detail.targetHint : {};
+    const hintBounds = targetHint.bounds && typeof targetHint.bounds === "object" ? targetHint.bounds : {};
+    const hintX = Number(hintBounds.x);
+    const hintY = Number(hintBounds.y);
+    const hintWidth = Number(hintBounds.w);
+    const hintHeight = Number(hintBounds.h);
+    const hasUsableHintBounds = Number.isFinite(hintX) && Number.isFinite(hintY) &&
+      Number.isFinite(hintWidth) && Number.isFinite(hintHeight) && hintWidth > 0 && hintHeight > 0;
+    const point = hasUsableHintBounds
+      ? { x: hintX + (hintWidth / 2), y: hintY + (hintHeight / 2) }
+      : rawPoint;
     const hintedText = `${targetHint.id || ""} ${targetHint.selector || ""}`;
     const hintedUuid = hintedText.match(/(?:^|#)uuid-([A-Za-z0-9_-]+)/)?.[1] || null;
     const pointElement = point ? document.elementFromPoint(point.x, point.y) : null;
@@ -1958,6 +1968,8 @@ function installMainWorldBridge(bridgeNonce) {
     if (cellValue == null && cell) cellValue = normalizeCprText(cell.innerText || cell.textContent) || null;
 
     return {
+      source: "exbuilder6_runtime_adapter",
+      parser: hasUsableHintBounds ? "exbuilder6_target_bounds_runtime" : "exbuilder6_point_runtime",
       gridId: grid.id || root.id || null,
       datasetId: ds?.id || null,
       componentId: uuid ? `uuid-${uuid}` : root.id || null,
@@ -1970,15 +1982,28 @@ function installMainWorldBridge(bridgeNonce) {
       cellValue,
       rawValue: cellValue,
       headers,
+      rowData,
       rowContext: {
         row_path: [],
         row_label: null,
+        row_data: rowData,
         values: rowData,
         map: rowData,
         confidence: rowIndex != null && Object.keys(rowData).length > 0 ? 0.99 : 0.55,
         capture_status: rowIndex != null && Object.keys(rowData).length > 0 ? "complete" : "partial",
         warnings: rowIndex == null ? ["cpr_selected_row_unresolved"] : []
-      }
+      },
+      confidence: {
+        grid: 0.98,
+        row_mapping: rowIndex != null && Object.keys(rowData).length > 0 ? 0.99 : 0.55,
+        column_mapping: columnLabel || columnId ? 0.95 : 0.55,
+        cell_value: cellValue != null ? 0.98 : 0.35
+      },
+      captureStatus: rowIndex != null && Object.keys(rowData).length > 0 ? "complete" : "partial",
+      warnings: [
+        ...(hasUsableHintBounds ? ["resolved_from_target_bounds"] : []),
+        ...(rowIndex == null ? ["cpr_selected_row_unresolved"] : [])
+      ]
     };
   };
 

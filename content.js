@@ -1,5 +1,5 @@
 ﻿(function() {
-  const COLLECTOR_BUILD = "2026-07-29-cpr-menu-path-v11";
+  const COLLECTOR_BUILD = "2026-08-03-workflow-context-prod-v1";
   const EXTENSION_VERSION = chrome.runtime?.getManifest?.().version || "0.1.2";
   const EXTENSION_BUILD = `shell-${EXTENSION_VERSION}`;
   const REMOTE_SDK_SOURCE = "RAINBOW_COLLECTOR_SDK";
@@ -52,6 +52,8 @@
   const ROUTE_POLL_INTERVAL_MS = 1000;
   const CAUSAL_RELATION_TTL_MS = 5000;
   const STRUCTURE_CACHE_TTL_MS = 5000;
+  const STRUCTURED_GRID_LIMIT = 8;
+  const STRUCTURED_GRID_ROW_LIMIT = 10;
   const MAX_CONTEXT_CANDIDATES = 3;
   const MAX_DEBUG_CANDIDATES = 3;
   const MAX_GRID_ROW_FIELDS = 30;
@@ -244,6 +246,8 @@
   let popupSequence = 0;
   let visiblePopupIds = new Set();
   let popupLifecycleTimer = null;
+  let pendingPopupLifecycleCause = null;
+  const POPUP_STRUCTURE_SETTLE_MS = 650;
   let lowCostMutationObserver = null;
   const recentValueEventByElement = new WeakMap();
   const recentValueReflectionKeys = new Map();
@@ -517,6 +521,13 @@
     return Object.entries(runtimeConfig.modules || {})
       .filter(([, value]) => value !== false && value?.enabled !== false)
       .map(([name]) => name);
+  }
+
+  function runtimeModuleEnabled(name, defaultEnabled = true) {
+    const value = runtimeConfig?.modules?.[name];
+    if (value === false || value?.enabled === false) return false;
+    if (value === true || value?.enabled === true) return true;
+    return defaultEnabled;
   }
 
   function includesAnyText(value, needles) {
@@ -1166,17 +1177,22 @@
 
   function normalizeExBuilder6GridContext(value) {
     if (!value || typeof value !== "object") return null;
-    const rowContext = value.rowContext && typeof value.rowContext === "object"
+    const rowData = limitObjectEntries(
+      value.rowData || value.rowContext?.row_data || value.rowContext?.rowData || null,
+      MAX_GRID_ROW_FIELDS
+    );
+    const rowContext = (value.rowContext && typeof value.rowContext === "object") || rowData
       ? {
           row_index: value.rowIndex ?? null,
-          row_path: normalizePathParts(value.rowContext.row_path || value.rowContext.rowPath || []),
-          row_label: value.rowContext.row_label || value.rowContext.rowLabel || null,
-          values: limitObjectEntries(value.rowContext.values || value.rowContext.map || null, MAX_GRID_ROW_FIELDS),
-          map: limitObjectEntries(value.rowContext.map || value.rowContext.values || null, MAX_GRID_ROW_FIELDS),
-          confidence: value.rowContext.confidence ?? 0.95,
-          candidates: limitCandidateList(value.rowContext.candidates || [], MAX_CONTEXT_CANDIDATES),
-          capture_status: value.rowContext.capture_status || "complete",
-          warnings: normalizeWarningList(value.rowContext.warnings || [])
+          row_path: normalizePathParts(value.rowContext?.row_path || value.rowContext?.rowPath || []),
+          row_label: value.rowContext?.row_label || value.rowContext?.rowLabel || null,
+          values: limitObjectEntries(rowData || value.rowContext?.values || value.rowContext?.map || null, MAX_GRID_ROW_FIELDS),
+          map: limitObjectEntries(rowData || value.rowContext?.map || value.rowContext?.values || null, MAX_GRID_ROW_FIELDS),
+          row_data: rowData,
+          confidence: value.rowContext?.confidence ?? 0.95,
+          candidates: limitCandidateList(value.rowContext?.candidates || [], MAX_CONTEXT_CANDIDATES),
+          capture_status: value.rowContext?.capture_status || (rowData ? "complete" : "partial"),
+          warnings: normalizeWarningList(value.rowContext?.warnings || [])
         }
       : null;
 
@@ -1185,34 +1201,34 @@
       promoted: true,
       candidate_only: false,
       framework: "exbuilder6",
-      source: "exbuilder6_internal_adapter",
-      parser: "exbuilder6_grid_model",
+      source: value.source || "exbuilder6_internal_adapter",
+      parser: value.parser || "exbuilder6_grid_model",
       grid_type: "grid",
       grid_role: "data_grid",
       grid_id: value.gridId || null,
       dataset_id: value.datasetId || null,
       component_id: value.componentId || null,
-        app_id: value.appId || null,
-        row_index: value.rowIndex ?? null,
-        col_index: value.colIndex ?? null,
-        model_col_index: value.modelColIndex ?? null,
-        column_id: value.columnId || null,
+      app_id: value.appId || null,
+      row_index: value.rowIndex ?? null,
+      col_index: value.colIndex ?? null,
+      model_col_index: value.modelColIndex ?? null,
+      column_id: value.columnId || null,
       column_label: value.columnLabel || null,
       column_path: value.columnLabel ? [value.columnLabel] : null,
       column_key: value.columnId || value.columnLabel || null,
       cell_value: value.cellValue ?? null,
       raw_value: value.rawValue ?? null,
       row_context: rowContext,
-      row_context_map: rowContext?.map || rowContext?.values || null,
+      row_context_map: rowData || rowContext?.map || rowContext?.values || null,
       headers: Array.isArray(value.headers) ? value.headers.slice(0, 40) : null,
       confidence: {
-        grid: 0.98,
+        grid: value.confidence?.grid ?? (typeof value.confidence === "number" ? value.confidence : 0.98),
         row_mapping: rowContext?.confidence ?? 0.95,
         column_mapping: 0.95,
         cell_value: value.cellValue != null ? 0.98 : 0.35
       },
-      capture_status: "complete",
-      warnings: []
+      capture_status: value.captureStatus || value.capture_status || (rowContext ? "complete" : "partial"),
+      warnings: normalizeWarningList(value.warnings || [])
     };
   }
 
@@ -2362,12 +2378,16 @@
 
   function rememberApiTransactionLink(row) {
     if (!row?.interaction_id || !row?.event_time) return;
+    const popupContext = row?.payload?.popup_context && typeof row.payload.popup_context === "object"
+      ? row.payload.popup_context
+      : null;
     lastApiTransactionLink = {
       interactionId: row.interaction_id,
       eventId: row.event_id || null,
       action: row.action || "api_transaction",
       eventTime: row.event_time,
       timeMs: new Date(row.event_time).getTime(),
+      popupId: popupContext?.active_popup_id || null,
       strategy: "recent_api_transaction"
     };
   }
@@ -5856,10 +5876,90 @@
     };
   }
 
+  function cleopatraMenuLabel(item) {
+    if (!(item instanceof Element)) return null;
+    const label = cleanMenuLabel(
+      item.getAttribute("aria-label") ||
+      item.getAttribute("title") ||
+      visibleTextOf(item) ||
+      textOf(item) ||
+      ""
+    );
+    return shouldUseMenuLabel(label) ? label : null;
+  }
+
+  function resolveCleopatraMenuPath(target) {
+    if (
+      location.origin !== "http://211.109.22.33:8791" ||
+      !(target instanceof Element) ||
+      !runtimeModuleEnabled("cleopatra_menu_adapter")
+    ) {
+      return null;
+    }
+
+    const sideItem = target.closest?.(".cl-sidenavigation a.cl-folder, .cl-sidenavigation a.cl-leaf");
+    if (sideItem instanceof Element) {
+      const path = [];
+      const ownLabel = cleopatraMenuLabel(sideItem);
+      if (ownLabel) path.unshift(ownLabel);
+
+      let list = sideItem.closest?.(".cl-list") || null;
+      const seenLists = new Set();
+      while (list instanceof Element && !seenLists.has(list) && path.length < 8) {
+        seenLists.add(list);
+        const owner = list.parentElement;
+        const parentItem = owner?.querySelector?.(":scope > a.cl-folder, :scope > a.cl-leaf") || null;
+        const parentLabel = parentItem && parentItem !== sideItem ? cleopatraMenuLabel(parentItem) : null;
+        if (parentLabel) path.unshift(parentLabel);
+        list = owner?.closest?.(".cl-list") || null;
+      }
+
+      const topLabel = activeCprTopMenuPath[0] || null;
+      if (topLabel && path[0] !== topLabel) path.unshift(topLabel);
+      const normalizedPath = dedupeOrderedParts(path).slice(-8);
+      if (normalizedPath.length === 0) return null;
+      return {
+        item: sideItem,
+        source: "cleopatra",
+        label: normalizedPath[normalizedPath.length - 1],
+        path: normalizedPath,
+        pathText: normalizedPath.join(" > "),
+        parser: "cl_sidenavigation",
+        score: 12,
+        confidence: normalizedPath.length >= 2 ? 0.98 : 0.9,
+        confidenceReasons: ["cl_sidenavigation", "nested_cl_list"],
+        captureStatus: normalizedPath.length >= 2 ? "complete" : "partial",
+        warnings: normalizedPath.length >= 2 ? [] : ["shallow_menu_path"]
+      };
+    }
+
+    const topItem = target.closest?.("[id^='pt-']") || null;
+    if (!(topItem instanceof Element)) return null;
+    const topLabel = cleopatraMenuLabel(topItem);
+    if (!topLabel) return null;
+    activeCprTopMenuPath = [topLabel];
+    activeCprDomMenuPath = [];
+    return {
+      item: topItem,
+      source: "cleopatra",
+      label: topLabel,
+      path: [topLabel],
+      pathText: topLabel,
+      parser: "cl_top_program_menu",
+      score: 11,
+      confidence: 0.92,
+      confidenceReasons: ["top_program_id", "direct_click"],
+      captureStatus: "partial",
+      warnings: ["top_menu_node_only"]
+    };
+  }
+
   function resolveTreePath(target) {
     if (!(target instanceof Element)) return null;
     const cprTopItem = resolveCprTopNavigationPath(target);
     if (cprTopItem) return cprTopItem;
+    const cleopatraItem = resolveCleopatraMenuPath(target);
+    if (cleopatraItem) return cleopatraItem;
     const cprItem = resolveCprLevelMenuPath(target);
     if (cprItem) return cprItem;
     const ariaItem = target.closest('[role="treeitem"]');
@@ -5942,28 +6042,69 @@
     }).filter((item) => item.rows.length > 0);
   }
 
-  function structuredAriaGrids() {
-    return [...document.querySelectorAll('[role="grid"]')].slice(0, 4).map((grid, gridIndex) => {
-      const headers = [...grid.querySelectorAll('[role="columnheader"]')].map((cell) => visibleTextOf(cell)).filter(Boolean);
-      const rows = [...grid.querySelectorAll('[role="row"]')].slice(1, 10).map((row) => {
-        return [...row.querySelectorAll('[role="gridcell"], [role="cell"]')].map((cell, index) => ({
-          label: headers[index] || `col_${index + 1}`,
-          value: sanitizeGridValue(visibleTextOf(cell) || textOf(cell), headers[index] || `col_${index + 1}`, cell),
-          row_index: cell.getAttribute("data-row-index") || null,
-          col_id: cell.getAttribute("data-col-id") || null,
-          selector: cssPath(cell)
-        })).filter((item) => item.value);
-      }).filter((row) => row.length > 0);
+  function ariaGridHeaderLabels(grid) {
+    return [...grid.querySelectorAll('[role="columnheader"]')]
+      .slice(0, GRID_ROW_DATA_LIMIT)
+      .map((cell, index) => cleanMenuLabel(visibleTextOf(cell) || textOf(cell) || "") || `col_${index + 1}`);
+  }
 
-      return {
-        kind: "aria_grid",
-        grid_index: gridIndex,
-        id: grid.id || null,
-        selector: cssPath(grid),
-        headers,
-        rows
-      };
-    }).filter((item) => item.rows.length > 0);
+  function ariaGridDataRows(grid) {
+    return [...grid.querySelectorAll('[role="row"]')]
+      .filter((row) => row.querySelector('[role="gridcell"], [role="cell"], [role="rowheader"]'));
+  }
+
+  function nearbyGridTotalCount(grid) {
+    const ariaCount = readNumericAttr(grid, ["aria-rowcount", "data-row-count", "data-total-count"]);
+    if (ariaCount != null && ariaCount >= 0) return ariaCount;
+    const nearby = String(grid.parentElement?.textContent || "").replace(/\s+/g, " ").slice(0, 1000);
+    const match = nearby.match(/(?:총|전체)\s*(?:건수)?\s*[:：]?\s*([\d,]+)\s*건/);
+    return match ? Number(match[1].replace(/,/g, "")) : null;
+  }
+
+  function scoreSnapshotGrid(grid) {
+    if (!(grid instanceof Element)) return -999;
+    let score = isVisibleCandidate(grid) ? 4 : -4;
+    if (closestPopupRoot(grid)) score += 6;
+    if (grid.contains(document.activeElement)) score += 5;
+    if (grid.closest("main,[role='main'],#app,#root")) score += 2;
+    score += Math.min(4, ariaGridDataRows(grid).length);
+    return score;
+  }
+
+  function structuredAriaGrids() {
+    return [...document.querySelectorAll('[role="grid"]')]
+      .map((grid, documentIndex) => ({ grid, documentIndex, score: scoreSnapshotGrid(grid) }))
+      .sort((a, b) => b.score - a.score || a.documentIndex - b.documentIndex)
+      .slice(0, STRUCTURED_GRID_LIMIT)
+      .map(({ grid, documentIndex, score }, gridIndex) => {
+        const headers = ariaGridHeaderLabels(grid);
+        const rows = ariaGridDataRows(grid).slice(0, STRUCTURED_GRID_ROW_LIMIT).map((row, rowOffset) => {
+          return [...row.querySelectorAll('[role="gridcell"], [role="cell"]')]
+            .slice(0, GRID_ROW_DATA_LIMIT)
+            .map((cell, index) => {
+              const label = headers[index] || `col_${index + 1}`;
+              return {
+                label,
+                value: sanitizeGridValue(visibleTextOf(cell) || textOf(cell), label, cell),
+                row_index: readNumericAttr(row, ["aria-rowindex", "data-row-index"]) ?? rowOffset,
+                col_id: cell.getAttribute("data-col-id") || null,
+                selector: cssPath(cell)
+              };
+            }).filter((item) => item.value);
+        }).filter((row) => row.length > 0);
+
+        return {
+          kind: "aria_grid",
+          grid_index: gridIndex,
+          document_index: documentIndex,
+          priority_score: score,
+          id: grid.id || null,
+          selector: cssPath(grid),
+          headers,
+          total_count: nearbyGridTotalCount(grid),
+          rows
+        };
+      }).filter((item) => item.rows.length > 0 || item.headers.length > 0);
   }
 
   function resolveAriaGridCellContext(target, event = null) {
@@ -6185,6 +6326,9 @@
       eventTimeOverride: receivedAt,
       correlationId: pending.correlationId || null,
       relatedInteractionId: pending.originalInteractionId || null,
+      relatedEventId: pending.originalEventId || null,
+      parentEventId: pending.originalEventId || null,
+      causeEventId: pending.originalEventId || null,
       gridContext: normalizedContext,
       payload: {
         kind: "grid_context_enrichment",
@@ -6208,6 +6352,9 @@
       eventTimeOverride: receivedAt,
       correlationId: pending.correlationId || null,
       relatedInteractionId: pending.originalInteractionId || null,
+      relatedEventId: pending.originalEventId || null,
+      parentEventId: pending.originalEventId || null,
+      causeEventId: pending.originalEventId || null,
       gridContext: normalizedContext,
       elementText:
         gridCellPayload.cell_value != null
@@ -6470,7 +6617,8 @@
     }
 
     const now = Date.now();
-    if (structureCache && !structureCacheDirty && now - structureCacheUpdatedAt < STRUCTURE_CACHE_TTL_MS) {
+    const forceRefresh = extra?.force_full_snapshot === true || extra?.force_refresh === true;
+    if (!forceRefresh && structureCache && !structureCacheDirty && now - structureCacheUpdatedAt < STRUCTURE_CACHE_TTL_MS) {
       return {
         ...structureCache,
         captured_at: new Date().toISOString(),
@@ -6994,6 +7142,23 @@
   function sendInteractionRows(rows, sourceEl = null) {
     const firstRow = Array.isArray(rows) ? rows[0] : null;
     scheduleValueReflectionCheck(firstRow, sourceEl);
+    if (firstRow?.interaction_id) {
+      const sourcePopup = closestPopupRoot(sourceEl);
+      const sourcePopupState = sourcePopup ? ensurePopupState(sourcePopup) : null;
+      const lifecycleCause = {
+        openedByInteractionId: firstRow.interaction_id,
+        openedByEventId: firstRow.event_id || null,
+        sourceAction: firstRow.action || null,
+        closedByInteractionId: firstRow.interaction_id,
+        closedByEventId: firstRow.event_id || null,
+        closedByAction: firstRow.action || null,
+        closedFromPopupId: sourcePopupState?.popupId || null,
+        expiresAt: Date.now() + 1200
+      };
+      pendingPopupLifecycleCause = lifecycleCause;
+      schedulePopupLifecycleCheck("interaction_followup", lifecycleCause);
+      setTimeout(() => refreshPopupLifecycle("interaction_settled", lifecycleCause), 300);
+    }
     sendRows(rows);
   }
 
@@ -7123,6 +7288,18 @@
     if (extra?.relatedEventId) {
       payloadSource.related_event_id = extra.relatedEventId;
     }
+    const relationContextSource =
+      payloadSource.relation_context && typeof payloadSource.relation_context === "object" && !Array.isArray(payloadSource.relation_context)
+        ? { ...payloadSource.relation_context }
+        : {};
+    if (extra?.relatedInteractionId) relationContextSource.related_interaction_id = extra.relatedInteractionId;
+    if (extra?.relatedEventId) relationContextSource.related_event_id = extra.relatedEventId;
+    if (extra?.parentEventId) relationContextSource.parent_event_id = extra.parentEventId;
+    if (extra?.causeEventId) relationContextSource.cause_event_id = extra.causeEventId;
+    if (extra?.causalChainId) relationContextSource.causal_chain_id = extra.causalChainId;
+    if (Object.keys(relationContextSource).length > 0) {
+      payloadSource.relation_context = relationContextSource;
+    }
     const scopedPayloadSource = sanitizeInputPayloadForElement(payloadSource, el);
     const payloadFields = sanitizeStructuredValue(scopedPayloadSource, {
       key: "payload"
@@ -7160,7 +7337,11 @@
     const gridInteractionPayload = gridContext
       ? sanitizeStructuredValue(buildGridCellInteractionPayload(gridContext, {
           kind: "grid_cell_click",
-          source: action
+          source: action,
+          relatedInteractionId: extra?.relatedInteractionId || payloadFields?.grid_cell_click?.related_interaction_id || null,
+          relatedEventId: extra?.relatedEventId || payloadFields?.grid_cell_click?.related_event_id || null,
+          originalInteractionId: payloadFields?.grid_cell_click?.original_interaction_id || null,
+          originalEventId: payloadFields?.grid_cell_click?.original_event_id || null
         }), { key: "grid_cell_click" })
       : null;
     const inputContext = buildInputContextFromPayload(payloadFields, el, action);
@@ -7235,6 +7416,9 @@
           interaction_id: interactionId,
           related_interaction_id: extra?.relatedInteractionId || baseEventContext.related_interaction_id || null,
           related_event_id: extra?.relatedEventId || baseEventContext.related_event_id || null,
+          parent_event_id: extra?.parentEventId || baseEventContext.parent_event_id || null,
+          cause_event_id: extra?.causeEventId || baseEventContext.cause_event_id || null,
+          causal_chain_id: extra?.causalChainId || baseEventContext.causal_chain_id || null,
           action,
           event_time: eventTime,
           correlation_id: correlationId,
@@ -7658,9 +7842,14 @@
         openedByInteractionId: null,
         openedByEventId: null,
         sourceAction: null,
+        closedByInteractionId: null,
+        closedByEventId: null,
+        closedByAction: null,
         parentPopupId: null,
         openEmitted: false,
         closeEmitted: false,
+        structureSnapshotEmitted: false,
+        structureSnapshotTimer: null,
         lastDescriptor: null
       };
       popupStateByElement.set(el, state);
@@ -7687,6 +7876,9 @@
     if (options.sourceAction && !state.sourceAction) {
       state.sourceAction = options.sourceAction;
     }
+    if (options.closedByInteractionId) state.closedByInteractionId = options.closedByInteractionId;
+    if (options.closedByEventId) state.closedByEventId = options.closedByEventId;
+    if (options.closedByAction) state.closedByAction = options.closedByAction;
 
     return state;
   }
@@ -7795,13 +7987,22 @@
     const isClose = action === "popup_close";
     const lastActionTimeMs = Date.parse(lastUserAction?.eventTime || "");
     const lastActionPopupId = lastUserAction?.popupContext?.active_popup_id || null;
-    const closeAction = isClose &&
+    const exactCloseAction = isClose && state.closedByInteractionId
+      ? {
+          interactionId: state.closedByInteractionId,
+          eventId: state.closedByEventId || null,
+          action: state.closedByAction || null,
+          exact: true
+        }
+      : null;
+    const fallbackCloseAction = isClose &&
       lastUserAction?.action === "click" &&
       Number.isFinite(lastActionTimeMs) &&
       Date.now() - lastActionTimeMs <= 2000 &&
       lastActionPopupId === state.popupId
         ? lastUserAction
         : null;
+    const closeAction = exactCloseAction || fallbackCloseAction;
     const relatedInteractionId = isClose
       ? closeAction?.interactionId || null
       : state.openedByInteractionId || null;
@@ -7832,6 +8033,7 @@
       opener_event_id: state.openedByEventId,
       closer_interaction_id: closeAction?.interactionId || null,
       closer_event_id: closeAction?.eventId || null,
+      closer_action: closeAction?.action || null,
       message_candidate: el instanceof Element ? popupMessageEvidence(el) : null,
       stack
     };
@@ -7840,6 +8042,8 @@
       elementText: descriptor.title || action,
       relatedInteractionId,
       relatedEventId,
+      parentEventId: relatedEventId,
+      causeEventId: relatedEventId,
       payload: {
         kind: "popup_lifecycle",
         popup_context: popupContext,
@@ -7848,9 +8052,11 @@
         relation_context: {
           related_interaction_id: relatedInteractionId,
           related_event_id: relatedEventId,
+          parent_event_id: relatedEventId,
+          cause_event_id: relatedEventId,
           related_action: closeAction?.action || state.sourceAction || null,
           related_strategy: isClose
-            ? (closeAction ? "popup_closer_click" : "popup_close_unresolved")
+            ? (exactCloseAction ? "popup_closer" : (fallbackCloseAction ? "popup_closer_click" : "popup_close_unresolved"))
             : "popup_opener_action"
         },
         observed_at: observedAt
@@ -7863,16 +8069,77 @@
     return row;
   }
 
+  function schedulePopupStructureSnapshot(el, state, trigger = "mutation") {
+    if (!(el instanceof Element) || !state || state.structureSnapshotEmitted || state.closeEmitted) return;
+    if (state.structureSnapshotTimer) clearTimeout(state.structureSnapshotTimer);
+    state.structureSnapshotTimer = setTimeout(() => {
+      state.structureSnapshotTimer = null;
+      if (state.structureSnapshotEmitted || state.closeEmitted || !el.isConnected || !isPopupRoot(el)) return;
+
+      const popupContext = buildPopupContext(el);
+      const descriptor = popupDescriptor(el);
+      if (!popupContext || !descriptor) return;
+      const observedAt = new Date().toISOString();
+      const observedAtMs = new Date(observedAt).getTime();
+      const latestPopupApi = lastApiTransactionLink?.eventId &&
+        lastApiTransactionLink.popupId === state.popupId &&
+        Number.isFinite(lastApiTransactionLink.timeMs) &&
+        observedAtMs - lastApiTransactionLink.timeMs >= 0 &&
+        observedAtMs - lastApiTransactionLink.timeMs <= 5000
+        ? lastApiTransactionLink
+        : null;
+      const relatedInteractionId = state.openedByInteractionId || null;
+      const openerEventId = state.openedByEventId || null;
+      const relatedEventId = latestPopupApi?.eventId || openerEventId;
+      const relatedApiEventIds = latestPopupApi?.eventId ? [latestPopupApi.eventId] : [];
+      const row = buildRow(el, "popup_structure", {
+        eventTimeOverride: observedAt,
+        elementText: descriptor.title || "popup_structure",
+        relatedInteractionId,
+        relatedEventId,
+        parentEventId: relatedEventId,
+        causeEventId: openerEventId || relatedEventId,
+        payload: {
+          kind: "popup_structure",
+          observed_at: observedAt,
+          settle_trigger: trigger,
+          related_api_event_ids: relatedApiEventIds,
+          popup_context: popupContext,
+          relation_context: {
+            related_interaction_id: relatedInteractionId,
+            related_event_id: relatedEventId,
+            parent_event_id: relatedEventId,
+            cause_event_id: openerEventId || relatedEventId,
+            related_api_event_ids: relatedApiEventIds,
+            related_strategy: latestPopupApi ? "popup_structure_after_api" : "popup_opener"
+          }
+        },
+        popupContext,
+        snapshot: captureSnapshot("popup_structure", {
+          force_full_snapshot: true,
+          force_refresh: true,
+          popup_context: popupContext
+        })
+      });
+      state.structureSnapshotEmitted = true;
+      sendRows([row]);
+    }, POPUP_STRUCTURE_SETTLE_MS);
+  }
+
   function refreshPopupLifecycle(trigger = "mutation", options = {}) {
+    const activeCause = pendingPopupLifecycleCause?.expiresAt > Date.now()
+      ? pendingPopupLifecycleCause
+      : null;
+    const lifecycleOptions = { ...(activeCause || {}), ...(options || {}) };
     const currentIds = new Set();
     const roots = visiblePopupRoots();
     for (const root of roots) {
       const existingState = popupStateByElement.get(root);
       const state = ensurePopupState(root, {
         parentPopupId: existingState ? existingState.parentPopupId : topKnownVisiblePopupIdExcluding(existingState?.popupId),
-        openedByInteractionId: options.openedByInteractionId || lastUserAction?.interactionId || null,
-        openedByEventId: options.openedByEventId || lastUserAction?.eventId || null,
-        sourceAction: options.sourceAction || lastUserAction?.action || null
+        openedByInteractionId: lifecycleOptions.openedByInteractionId || lastUserAction?.interactionId || null,
+        openedByEventId: lifecycleOptions.openedByEventId || lastUserAction?.eventId || null,
+        sourceAction: lifecycleOptions.sourceAction || lastUserAction?.action || null
       });
       if (!state) continue;
       currentIds.add(state.popupId);
@@ -7881,6 +8148,7 @@
         state.openEmitted = true;
         emitPopupLifecycleRow(root, "popup_open", state, trigger);
       }
+      schedulePopupStructureSnapshot(root, state, trigger);
       state.closeEmitted = false;
     }
 
@@ -7888,6 +8156,15 @@
       if (currentIds.has(popupId)) continue;
       const state = popupStateById.get(popupId);
       if (!state || state.closeEmitted) continue;
+      if (state.structureSnapshotTimer) {
+        clearTimeout(state.structureSnapshotTimer);
+        state.structureSnapshotTimer = null;
+      }
+      if (lifecycleOptions.closedFromPopupId === popupId) {
+        state.closedByInteractionId = lifecycleOptions.closedByInteractionId || null;
+        state.closedByEventId = lifecycleOptions.closedByEventId || null;
+        state.closedByAction = lifecycleOptions.closedByAction || null;
+      }
       state.closeEmitted = true;
       emitPopupLifecycleRow(state.element, "popup_close", state, trigger);
       popupStateByElement.delete(state.element);
@@ -7913,7 +8190,10 @@
     if (popupLifecycleTimer) clearTimeout(popupLifecycleTimer);
     popupLifecycleTimer = setTimeout(() => {
       popupLifecycleTimer = null;
-      refreshPopupLifecycle(trigger, options);
+      const activeCause = pendingPopupLifecycleCause?.expiresAt > Date.now()
+        ? pendingPopupLifecycleCause
+        : null;
+      refreshPopupLifecycle(trigger, { ...(activeCause || {}), ...(options || {}) });
     }, 80);
   }
 
