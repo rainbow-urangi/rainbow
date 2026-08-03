@@ -6044,7 +6044,7 @@
 
   function ariaGridHeaderLabels(grid) {
     return [...grid.querySelectorAll('[role="columnheader"]')]
-      .slice(0, GRID_ROW_DATA_LIMIT)
+      .slice(0, MAX_GRID_ROW_FIELDS)
       .map((cell, index) => cleanMenuLabel(visibleTextOf(cell) || textOf(cell) || "") || `col_${index + 1}`);
   }
 
@@ -6080,7 +6080,7 @@
         const headers = ariaGridHeaderLabels(grid);
         const rows = ariaGridDataRows(grid).slice(0, STRUCTURED_GRID_ROW_LIMIT).map((row, rowOffset) => {
           return [...row.querySelectorAll('[role="gridcell"], [role="cell"]')]
-            .slice(0, GRID_ROW_DATA_LIMIT)
+            .slice(0, MAX_GRID_ROW_FIELDS)
             .map((cell, index) => {
               const label = headers[index] || `col_${index + 1}`;
               return {
